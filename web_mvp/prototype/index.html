@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Crater Web MVP Prototype</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 24px; background: #111; color: #eee; }
+    .card { background: #1f1f1f; border-radius: 8px; padding: 16px; max-width: 900px; }
+    video { width: 100%; margin-top: 12px; border-radius: 6px; }
+    .hint { color: #bbb; font-size: 0.95rem; margin-top: 8px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Crater Web MVP Prototype</h1>
+    <p>Select a local video to preview the upload UX flow.</p>
+    <input id="fileInput" type="file" accept="video/*" />
+    <video id="preview" controls></video>
+    <p class="hint">
+      This prototype only demonstrates client upload/preview. Full analysis should be executed
+      in a managed backend service that reuses the Python core engine.
+    </p>
+  </div>
+  <script>
+    const fileInput = document.getElementById("fileInput");
+    const preview = document.getElementById("preview");
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) return;
+      preview.src = URL.createObjectURL(file);
+    });
+  </script>
+</body>
+</html>
+

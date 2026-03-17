@@ -1,0 +1,2 @@
+"""Crater analysis application package."""
+
