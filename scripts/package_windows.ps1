@@ -7,9 +7,9 @@ python -m pip install ".[dev]"
 pyinstaller `
   --name CraterAnalysis `
   --windowed `
+  --clean `
   --noconfirm `
   run_desktop.py
 
 Write-Host "Build complete. Output in dist/CraterAnalysis/"
 Write-Host "Wrap with Inno Setup or MSIX for signed installer distribution."
-

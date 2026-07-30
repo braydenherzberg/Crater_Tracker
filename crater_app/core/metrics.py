@@ -15,9 +15,26 @@ class CraterMetrics:
     max_crater_depth_px: float
     crater_area_px: float
     confidence: float
+    crater_center_x_px: float = 0.0
+    left_rim_x_px: float = 0.0
+    right_rim_x_px: float = 0.0
+    baseline_tilt_degrees: float = 0.0
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    # Compatibility aliases used by the original prototype and early files.
+    @property
+    def width_px(self) -> float:
+        return self.max_crater_width_px
+
+    @property
+    def depth_px(self) -> float:
+        return self.max_crater_depth_px
+
+    @property
+    def area_px2(self) -> float:
+        return self.crater_area_px
 
 
 def compute_metrics(
@@ -75,3 +92,41 @@ def compute_metrics(
         confidence=confidence,
     )
 
+
+def compute_geometry_metrics(
+    crater_points: List[Tuple[int, int]],
+    baseline_points: List[Tuple[int, int]],
+    confidence: float,
+) -> CraterMetrics:
+    """Measure a crater against its local rim-to-rim baseline."""
+
+    if len(crater_points) < 2 or len(crater_points) != len(baseline_points):
+        return compute_metrics([], 0)
+
+    xs = np.asarray([p[0] for p in crater_points], dtype=np.float64)
+    ys = np.asarray([p[1] for p in crater_points], dtype=np.float64)
+    baseline = np.asarray([p[1] for p in baseline_points], dtype=np.float64)
+    depths = np.maximum(ys - baseline, 0.0)
+    max_depth = float(depths.max())
+    width = float(xs[-1] - xs[0])
+    area = float(np.trapezoid(depths, xs))
+    avg_width = float(area / max_depth) if max_depth > 1e-9 else 0.0
+    center_index = int(np.argmax(depths))
+
+    dx = max(1e-9, float(xs[-1] - xs[0]))
+    baseline_tilt = float(
+        np.degrees(np.arctan2(float(baseline[-1] - baseline[0]), dx))
+    )
+    return CraterMetrics(
+        point_count=len(crater_points),
+        avg_crater_width_px=avg_width,
+        max_crater_width_px=width,
+        trace_width_px=width,
+        max_crater_depth_px=max_depth,
+        crater_area_px=area,
+        confidence=float(np.clip(confidence, 0.0, 1.0)),
+        crater_center_x_px=float(xs[center_index]),
+        left_rim_x_px=float(xs[0]),
+        right_rim_x_px=float(xs[-1]),
+        baseline_tilt_degrees=baseline_tilt,
+    )

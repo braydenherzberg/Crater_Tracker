@@ -1,40 +1,68 @@
-# Release and Packaging Guide
+# Desktop release guide
 
-## 1) Prepare environment
+## Local builds
 
-- macOS:
-  - `python3 -m pip install .[dev]`
-- Windows:
-  - `python -m pip install .[dev]`
+Create a clean virtual environment, then run:
 
-## 2) Build desktop binaries
+### macOS
 
-- macOS:
-  - `bash scripts/package_macos.sh`
-- Windows:
-  - `powershell -ExecutionPolicy Bypass -File scripts/package_windows.ps1`
+```bash
+bash scripts/package_macos.sh
+```
 
-## 3) Sign installers
+Expected output: `dist/CraterAnalysis.app`.
 
-- macOS:
-  - Sign `dist/CraterAnalysis.app` with Apple Developer certificate.
-  - Notarize app and staple ticket.
-  - Package as `.dmg`.
-- Windows:
-  - Sign executable and installer with Authenticode certificate.
-  - Use Inno Setup or MSIX to create installer.
+### Windows
 
-## 4) Publish
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package_windows.ps1
+```
 
-- Upload artifacts to GitHub Releases.
-- Attach checksums.
-- Include `README.md` install and usage notes.
+Expected output: `dist/CraterAnalysis/CraterAnalysis.exe`.
 
-## 5) Verification checklist
+## GitHub Actions
 
-- App starts on a clean machine.
-- User can open local videos and run analysis.
-- Snapshot export works.
-- Visited-frame CSV and full-video CSV exports work.
-- Preset save/load works.
+`.github/workflows/build-desktop.yml` runs tests and builds on macOS and
+Windows. Manual runs upload downloadable workflow artifacts. A `v*` tag also
+creates a draft GitHub Release with platform archives.
+
+These builds are unsigned until signing credentials are configured.
+
+## Signing requirements
+
+### macOS
+
+For a normal double-click installation without a Gatekeeper override:
+
+1. Sign the application with a Developer ID Application certificate.
+2. Submit it to Apple notarization.
+3. Staple the notarization ticket.
+4. Package the signed application as a DMG or ZIP.
+
+### Windows
+
+For reduced SmartScreen warnings:
+
+1. Sign the executable and installer with an Authenticode certificate.
+2. Package with MSIX or a maintained installer builder.
+3. Sign the final installer.
+
+Signing identities, secrets, and legal publisher names are owner-controlled
+release inputs and must not be committed.
+
+## Release verification
+
+Test each produced package on a clean supported machine:
+
+- Launch by double-clicking; no Python installation is present.
+- Open MP4 and MOV samples.
+- Scrub, play, and run Auto Find Crater.
+- Confirm overlay alignment and units.
+- Save/load a preset and session.
+- Export snapshot, profile CSV, and metrics CSV.
+- Reopen exported files in standard applications.
+- Verify app version and archive checksum.
+
+Before making the repository public, the owner must select and add an
+appropriate open-source license.
 

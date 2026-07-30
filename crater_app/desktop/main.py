@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressDialog,
     QScrollArea,
     QSizePolicy,
     QSlider,
@@ -34,7 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from crater_app.core.analysis import AnalysisEngine, AnalysisResult
-from crater_app.core.metrics import compute_metrics
+from crater_app.core.metrics import compute_geometry_metrics, compute_metrics
 from crater_app.core.settings import AnalysisSettings
 from crater_app.core.video_reader import VideoReader
 from crater_app.desktop.exporter import export_metrics_csv, export_profile_csv, export_snapshot
@@ -56,6 +57,7 @@ from crater_app.desktop.sessions import (
     save_named_session,
     save_session,
 )
+from crater_app import __version__
 
 
 @dataclass
@@ -64,6 +66,9 @@ class StarredEntry:
     settings: AnalysisSettings
     profile_points: List[Tuple[int, int]]
     frame_width_px: int
+    crater_points: Optional[List[Tuple[int, int]]] = None
+    baseline_points: Optional[List[Tuple[int, int]]] = None
+    confidence: float = 0.0
 
 
 def frame_to_pixmap(frame_bgr: np.ndarray) -> QPixmap:
@@ -92,7 +97,7 @@ class CraterDashboardWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Crater Analysis Desktop")
+        self.setWindowTitle(f"Crater Side-Profile Analyzer {__version__}")
 
         self.settings_store = QSettings("CraterProject", "CraterDesktop")
         self.engine = AnalysisEngine()
@@ -161,6 +166,13 @@ class CraterDashboardWindow(QMainWindow):
         open_btn.clicked.connect(self._choose_video)
         file_form.addWidget(open_btn)
 
+        auto_find_btn = QPushButton("Auto Find Crater")
+        auto_find_btn.setToolTip(
+            "Sample the recording and jump to the strongest automatically detected crater."
+        )
+        auto_find_btn.clicked.connect(self._auto_find_crater)
+        file_form.addWidget(auto_find_btn)
+
         play_row = QHBoxLayout()
         self.play_btn = QPushButton("Play")
         self.play_btn.clicked.connect(self._toggle_play)
@@ -196,6 +208,14 @@ class CraterDashboardWindow(QMainWindow):
         group = QGroupBox("Analysis Controls")
         form = QFormLayout(group)
         form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+
+        self.auto_surface_check = QCheckBox("Automatic side-profile tracking")
+        self.auto_surface_check.setChecked(self.analysis_settings.auto_surface)
+        self.auto_surface_check.setToolTip(
+            "Automatically trace the material/air boundary and infer crater rims, "
+            "baseline, depth, width, and area."
+        )
+        self.auto_surface_check.stateChanged.connect(self._sync_settings)
 
         self.threshold_slider, self.threshold_label, threshold_row = self._slider_control(
             0, 255, self.analysis_settings.threshold
@@ -246,6 +266,7 @@ class CraterDashboardWindow(QMainWindow):
         self.surface_slider.setToolTip("Surface Boundary")
         self.tilt_slider.setToolTip("Tilt angle (-7 to +7 in 0.25 degree steps)")
 
+        form.addRow(self.auto_surface_check)
         form.addRow(self._form_label("Threshold"), threshold_row)
         form.addRow(self._form_label("Smoothing"), smoothing_row)
         form.addRow(self._form_label("Despeckle"), despeckle_row)
@@ -472,6 +493,8 @@ class CraterDashboardWindow(QMainWindow):
                 self.video.release()
             self.video = VideoReader(path)
             self.current_video_path = path
+            self.run_fps = self.video.fps
+            self.fps_label.setText(f"FPS: {self.run_fps:.3f}")
             self.current_frame_index = 0
             self.frame_slider.setMaximum(max(0, self.video.frame_count - 1))
             self.frame_slider.setValue(0)
@@ -530,6 +553,7 @@ class CraterDashboardWindow(QMainWindow):
         self.guide_top_label.setText(str(self.guide_top_slider.value()))
         self._update_scan_mode_label()
         self.analysis_settings = AnalysisSettings(
+            auto_surface=self.auto_surface_check.isChecked(),
             threshold=self.threshold_slider.value(),
             smoothing=self.smoothing_slider.value(),
             despeckle=self.despeckle_slider.value(),
@@ -544,7 +568,22 @@ class CraterDashboardWindow(QMainWindow):
             top_margin=self.guide_top_slider.value(),
             x_step=self.analysis_settings.x_step,
             real_width_mm=self.real_width_spin.value(),
+            auto_working_width_px=self.analysis_settings.auto_working_width_px,
+            auto_search_top_fraction=self.analysis_settings.auto_search_top_fraction,
+            auto_search_bottom_fraction=self.analysis_settings.auto_search_bottom_fraction,
+            auto_min_crater_width_fraction=self.analysis_settings.auto_min_crater_width_fraction,
+            auto_max_crater_width_fraction=self.analysis_settings.auto_max_crater_width_fraction,
         )
+        for widget in (
+            self.threshold_slider,
+            self.smoothing_slider,
+            self.despeckle_slider,
+            self.zone_left_slider,
+            self.zone_right_slider,
+            self.surface_slider,
+            self.scan_toggle,
+        ):
+            widget.setEnabled(not self.analysis_settings.auto_surface)
         self._render_current()
 
     def _render_current(self) -> None:
@@ -593,19 +632,37 @@ class CraterDashboardWindow(QMainWindow):
                 (255, 0, 0),
                 1,
             )
-            draw_both((left, 0), (left, h), (0, 255, 255), 1)
-            draw_both((right, 0), (right, h), (0, 255, 255), 1)
-            draw_both(
-                (settings.left_margin, settings.surface_boundary),
-                (w - settings.right_margin, settings.surface_boundary),
-                (255, 255, 0),
-                2,
-            )
+            if not settings.auto_surface:
+                draw_both((left, 0), (left, h), (0, 255, 255), 1)
+                draw_both((right, 0), (right, h), (0, 255, 255), 1)
+                draw_both(
+                    (settings.left_margin, settings.surface_boundary),
+                    (w - settings.right_margin, settings.surface_boundary),
+                    (255, 255, 0),
+                    2,
+                )
 
         if self.show_profile.isChecked() and len(result.profile_points) > 1:
             pts = np.array(result.profile_points, np.int32).reshape((-1, 1, 2))
             cv2.polylines(current_frame, [pts], isClosed=False, color=(0, 255, 0), thickness=3)
             cv2.polylines(mask_display, [pts], isClosed=False, color=(0, 255, 0), thickness=3)
+            if result.geometry is not None:
+                crater_pts = np.asarray(
+                    result.geometry.crater_points, dtype=np.int32
+                ).reshape((-1, 1, 2))
+                baseline_pts = np.asarray(
+                    result.geometry.baseline_points, dtype=np.int32
+                ).reshape((-1, 1, 2))
+                for panel in (current_frame, mask_display):
+                    cv2.polylines(
+                        panel, [crater_pts], isClosed=False, color=(0, 165, 255), thickness=4
+                    )
+                    cv2.polylines(
+                        panel, [baseline_pts], isClosed=False, color=(255, 200, 0), thickness=2
+                    )
+                    cv2.circle(panel, result.geometry.left_rim, 7, (255, 80, 80), -1)
+                    cv2.circle(panel, result.geometry.right_rim, 7, (255, 80, 80), -1)
+                    cv2.circle(panel, result.geometry.center, 7, (0, 80, 255), -1)
 
         cv2.putText(
             current_frame,
@@ -632,16 +689,20 @@ class CraterDashboardWindow(QMainWindow):
 
     def _update_metrics(self, result: AnalysisResult) -> None:
         m = result.metrics
+        frame_width = max(1, result.frame.shape[1])
+        mm_per_px = self.analysis_settings.real_width_mm / frame_width
+        width_mm = m.max_crater_width_px * mm_per_px
+        depth_mm = m.max_crater_depth_px * mm_per_px
+        area_mm2 = m.crater_area_px * (mm_per_px**2)
         self.metrics_label.setText(
             "\n".join(
                 [
-                    f"points: {m.point_count}",
-                    f"avg_crater_width_px: {m.avg_crater_width_px:.1f}",
-                    f"max_crater_width_px: {m.max_crater_width_px:.1f}",
-                    f"trace_width_px: {m.trace_width_px:.1f}",
-                    f"max_crater_depth_px: {m.max_crater_depth_px:.1f}",
-                    f"crater_area_px: {m.crater_area_px:.1f}",
-                    f"confidence: {m.confidence:.2f}",
+                    f"{result.status} ({result.detection_mode})",
+                    f"Rim-to-rim width: {width_mm:.2f} mm  ({m.max_crater_width_px:.1f} px)",
+                    f"Maximum depth: {depth_mm:.2f} mm  ({m.max_crater_depth_px:.1f} px)",
+                    f"Cross-section area: {area_mm2:.2f} mm²  ({m.crater_area_px:.1f} px²)",
+                    f"Baseline tilt: {m.baseline_tilt_degrees:+.2f}°",
+                    f"Confidence: {m.confidence:.0%}",
                 ]
             )
         )
@@ -659,6 +720,17 @@ class CraterDashboardWindow(QMainWindow):
             settings=copy.deepcopy(self.analysis_settings),
             profile_points=list(self.current_result.profile_points),
             frame_width_px=frame_w,
+            crater_points=(
+                list(self.current_result.geometry.crater_points)
+                if self.current_result.geometry is not None
+                else None
+            ),
+            baseline_points=(
+                list(self.current_result.geometry.baseline_points)
+                if self.current_result.geometry is not None
+                else None
+            ),
+            confidence=self.current_result.metrics.confidence,
         )
         self.starred_frames[self.current_frame_index] = entry
         self._refresh_starred_list()
@@ -686,6 +758,7 @@ class CraterDashboardWindow(QMainWindow):
         self._on_frame_changed(frame_idx)
 
     def _apply_settings_to_ui(self, settings: AnalysisSettings) -> None:
+        self.auto_surface_check.blockSignals(True)
         self.threshold_slider.blockSignals(True)
         self.smoothing_slider.blockSignals(True)
         self.despeckle_slider.blockSignals(True)
@@ -700,6 +773,7 @@ class CraterDashboardWindow(QMainWindow):
         self.guide_right_slider.blockSignals(True)
         self.guide_top_slider.blockSignals(True)
 
+        self.auto_surface_check.setChecked(settings.auto_surface)
         self.threshold_slider.setValue(settings.threshold)
         self.smoothing_slider.setValue(settings.smoothing)
         self.despeckle_slider.setValue(settings.despeckle)
@@ -727,9 +801,108 @@ class CraterDashboardWindow(QMainWindow):
         self.guide_left_slider.blockSignals(False)
         self.guide_right_slider.blockSignals(False)
         self.guide_top_slider.blockSignals(False)
+        self.auto_surface_check.blockSignals(False)
 
         self.analysis_settings = copy.deepcopy(settings)
         self._sync_settings()
+
+    def _auto_find_crater(self) -> None:
+        if self.video is None or self.video.frame_count <= 0:
+            QMessageBox.warning(self, "Auto Find Crater", "Open a video first.")
+            return
+        if not self.analysis_settings.auto_surface:
+            QMessageBox.warning(
+                self,
+                "Auto Find Crater",
+                "Enable Automatic side-profile tracking first.",
+            )
+            return
+
+        sample_count = min(72, self.video.frame_count)
+        indices = np.unique(
+            np.linspace(0, self.video.frame_count - 1, sample_count, dtype=int)
+        )
+        progress = QProgressDialog(
+            "Sampling the video for crater candidates…",
+            "Cancel",
+            0,
+            len(indices),
+            self,
+        )
+        progress.setWindowTitle("Auto Find Crater")
+        progress.setMinimumDuration(0)
+        best_index: Optional[int] = None
+        best_status = ""
+        candidate_rows = []
+        for position, frame_index in enumerate(indices, start=1):
+            progress.setValue(position - 1)
+            progress.setLabelText(
+                f"Analyzing frame {frame_index:,} of {self.video.frame_count - 1:,}"
+            )
+            QApplication.processEvents()
+            if progress.wasCanceled():
+                break
+            frame = self.video.get_frame_copy(int(frame_index))
+            if frame is None:
+                continue
+            candidate = self.engine.analyze_frame(frame, self.analysis_settings)
+            width = candidate.metrics.max_crater_width_px
+            depth = candidate.metrics.max_crater_depth_px
+            if (
+                width <= 0.0
+                or depth / width > 0.65
+                or abs(candidate.metrics.baseline_tilt_degrees) > 20.0
+            ):
+                continue
+            score = (
+                depth
+                * (0.25 + candidate.metrics.confidence)
+            )
+            candidate_rows.append((score, int(frame_index), candidate))
+        progress.setValue(len(indices))
+
+        if candidate_rows:
+            # Favor a crater geometry that persists across neighboring samples.
+            # This reduces selection of one-frame dust, glare, or codec artifacts.
+            ranked_rows = []
+            for score, frame_index, candidate in candidate_rows:
+                metric = candidate.metrics
+                support = 0
+                for _, other_index, other in candidate_rows:
+                    if other_index == frame_index:
+                        continue
+                    if abs(other_index - frame_index) > max(
+                        3, int(self.video.frame_count / max(1, sample_count)) * 3
+                    ):
+                        continue
+                    other_metric = other.metrics
+                    center_close = abs(
+                        other_metric.crater_center_x_px - metric.crater_center_x_px
+                    ) <= max(30.0, metric.max_crater_width_px * 0.30)
+                    width_close = abs(
+                        other_metric.max_crater_width_px - metric.max_crater_width_px
+                    ) <= max(40.0, metric.max_crater_width_px * 0.45)
+                    if center_close and width_close:
+                        support += 1
+                stability_multiplier = 0.70 + min(0.60, support * 0.15)
+                ranked_rows.append(
+                    (score * stability_multiplier, frame_index, candidate)
+                )
+            _, best_index, best_candidate = max(ranked_rows, key=lambda row: row[0])
+            best_status = best_candidate.status
+
+        if best_index is None:
+            QMessageBox.warning(
+                self,
+                "Auto Find Crater",
+                "No crater candidate was found. Try manual mode or adjust the guide margins.",
+            )
+            return
+        self.frame_slider.setValue(best_index)
+        self.statusBar().showMessage(
+            f"Best sampled candidate: frame {best_index:,} — {best_status}",
+            10000,
+        )
 
     def _refresh_starred_list(self) -> None:
         self.starred_list.clear()
@@ -842,6 +1015,17 @@ class CraterDashboardWindow(QMainWindow):
                     "settings": entry.settings.to_dict(),
                     "profile_points": [[x, y] for x, y in entry.profile_points],
                     "frame_width_px": entry.frame_width_px,
+                    "crater_points": (
+                        [[x, y] for x, y in entry.crater_points]
+                        if entry.crater_points
+                        else []
+                    ),
+                    "baseline_points": (
+                        [[x, y] for x, y in entry.baseline_points]
+                        if entry.baseline_points
+                        else []
+                    ),
+                    "confidence": entry.confidence,
                 }
             )
         return {"video_path": self.current_video_path, "starred_frames": entries}
@@ -906,11 +1090,20 @@ class CraterDashboardWindow(QMainWindow):
             settings = AnalysisSettings.from_dict(item.get("settings", {}))
             profile_points = [(int(p[0]), int(p[1])) for p in item.get("profile_points", [])]
             frame_width_px = int(item.get("frame_width_px", 0))
+            crater_points = [
+                (int(p[0]), int(p[1])) for p in item.get("crater_points", [])
+            ]
+            baseline_points = [
+                (int(p[0]), int(p[1])) for p in item.get("baseline_points", [])
+            ]
             self.starred_frames[frame_idx] = StarredEntry(
                 frame_index=frame_idx,
                 settings=settings,
                 profile_points=profile_points,
                 frame_width_px=frame_width_px,
+                crater_points=crater_points or None,
+                baseline_points=baseline_points or None,
+                confidence=float(item.get("confidence", 0.0)),
             )
         self._refresh_starred_list()
 
@@ -1091,17 +1284,27 @@ class CraterDashboardWindow(QMainWindow):
             if entry.frame_width_px <= 0:
                 continue
             mm_per_px = entry.settings.real_width_mm / entry.frame_width_px
-            center_x = entry.frame_width_px // 2
-            bracket_left = center_x - entry.settings.zone_left
-            bracket_right = center_x + entry.settings.zone_right
-            zone_pts = [
-                (x, y) for x, y in entry.profile_points
-                if bracket_left < x < bracket_right
-            ]
-            crater_pts = self._trim_to_crater(zone_pts, entry.settings.surface_boundary)
-            if not crater_pts:
-                continue
-            m = compute_metrics(crater_pts, entry.settings.surface_boundary)
+            if entry.crater_points and entry.baseline_points:
+                m = compute_geometry_metrics(
+                    entry.crater_points,
+                    entry.baseline_points,
+                    entry.confidence,
+                )
+            else:
+                center_x = entry.frame_width_px // 2
+                bracket_left = center_x - entry.settings.zone_left
+                bracket_right = center_x + entry.settings.zone_right
+                zone_pts = [
+                    (x, y)
+                    for x, y in entry.profile_points
+                    if bracket_left < x < bracket_right
+                ]
+                crater_pts = self._trim_to_crater(
+                    zone_pts, entry.settings.surface_boundary
+                )
+                if not crater_pts:
+                    continue
+                m = compute_metrics(crater_pts, entry.settings.surface_boundary)
             rows.append(
                 {
                     "frame": frame_idx,
@@ -1142,4 +1345,3 @@ def run_desktop() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(run_desktop())
-

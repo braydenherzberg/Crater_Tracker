@@ -16,6 +16,9 @@ class VideoReader:
             raise RuntimeError(f"Could not open video: {video_path}")
 
         self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.fps = float(self.cap.get(cv2.CAP_PROP_FPS))
+        if not np.isfinite(self.fps) or self.fps <= 0:
+            self.fps = 30.0
         self._frames = None
         self._cache: "OrderedDict[int, np.ndarray]" = OrderedDict()
 
@@ -49,10 +52,17 @@ class VideoReader:
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, index)
         ok, frame = self.cap.read()
         if not ok:
-            # Video metadata over-reported frame count; clamp to actual limit.
-            if index < self.frame_count:
-                self.frame_count = index
-            return None
+            # Random access can fail transiently on inter-frame codecs. Reopen
+            # once and retry without corrupting the metadata-derived frame
+            # count; otherwise later valid frames become unreachable.
+            self.cap.release()
+            self.cap = cv2.VideoCapture(self.video_path)
+            if not self.cap.isOpened():
+                return None
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, index)
+            ok, frame = self.cap.read()
+            if not ok:
+                return None
 
         self._cache[index] = frame
         if len(self._cache) > self.max_cache_size:
@@ -68,4 +78,3 @@ class VideoReader:
     def release(self) -> None:
         if self.cap is not None and self.cap.isOpened():
             self.cap.release()
-

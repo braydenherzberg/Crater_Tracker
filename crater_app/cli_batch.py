@@ -19,6 +19,12 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional JSON file matching AnalysisSettings keys",
     )
+    parser.add_argument(
+        "--frame-step",
+        type=int,
+        default=1,
+        help="Analyze every Nth frame (useful for long high-speed recordings)",
+    )
     return parser.parse_args()
 
 
@@ -36,7 +42,7 @@ def main() -> int:
     reader = VideoReader(args.video)
     rows = []
     try:
-        for idx in range(reader.frame_count):
+        for idx in range(0, reader.frame_count, max(1, args.frame_step)):
             frame = reader.get_frame_copy(idx)
             if frame is None:
                 continue
@@ -47,6 +53,9 @@ def main() -> int:
             rows.append(
                 {
                     "frame_index": idx,
+                    "timestamp_ms": (idx / reader.fps) * 1000.0,
+                    "detection_mode": result.detection_mode,
+                    "status": result.status,
                     "avg_crater_width_mm": m.avg_crater_width_px * mm_per_px,
                     "max_crater_width_mm": m.max_crater_width_px * mm_per_px,
                     "trace_width_mm": m.trace_width_px * mm_per_px,
@@ -54,6 +63,7 @@ def main() -> int:
                     "crater_area_mm2": m.crater_area_px * (mm_per_px**2),
                     "point_count": m.point_count,
                     "confidence": m.confidence,
+                    "baseline_tilt_degrees": m.baseline_tilt_degrees,
                 }
             )
     finally:
@@ -65,4 +75,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

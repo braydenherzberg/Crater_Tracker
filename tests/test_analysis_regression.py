@@ -19,6 +19,7 @@ def test_analysis_is_deterministic_for_same_input():
     engine = AnalysisEngine()
     frame = make_synthetic_crater_frame()
     settings = AnalysisSettings(
+        auto_surface=False,
         threshold=100,
         smoothing=11,
         despeckle=5,
@@ -40,6 +41,7 @@ def test_synthetic_frame_produces_expected_crater_shape_metrics():
     engine = AnalysisEngine()
     frame = make_synthetic_crater_frame()
     settings = AnalysisSettings(
+        auto_surface=False,
         threshold=100,
         smoothing=11,
         despeckle=5,
@@ -59,3 +61,68 @@ def test_synthetic_frame_produces_expected_crater_shape_metrics():
     assert metrics.area_px2 > 100.0
     assert 0.25 <= metrics.confidence <= 1.0
 
+
+def make_side_profile_crater_frame(
+    width: int = 900,
+    height: int = 500,
+    tilt_px: float = 12.0,
+) -> np.ndarray:
+    """Bright air over dark material with a tilted, rimmed crater basin."""
+
+    frame = np.full((height, width, 3), 225, dtype=np.uint8)
+    xs = np.arange(width, dtype=np.float64)
+    baseline = 205.0 + tilt_px * (xs / max(1, width - 1))
+    left_rim_x, center_x, right_rim_x = 500, 650, 800
+    surface = baseline.copy()
+    inside = (xs >= left_rim_x) & (xs <= right_rim_x)
+    phase = (xs[inside] - left_rim_x) / (right_rim_x - left_rim_x)
+    surface[inside] += 72.0 * np.sin(np.pi * phase) ** 2
+    surface -= 7.0 * np.exp(-((xs - left_rim_x) / 24.0) ** 2)
+    surface -= 6.0 * np.exp(-((xs - right_rim_x) / 24.0) ** 2)
+    polygon = np.column_stack((xs.astype(np.int32), surface.astype(np.int32)))
+    polygon = np.vstack(
+        (
+            polygon,
+            np.asarray([[width - 1, height - 1], [0, height - 1]], dtype=np.int32),
+        )
+    )
+    cv2.fillPoly(frame, [polygon], (58, 54, 60))
+    noise = np.random.default_rng(42).normal(0, 2.0, frame.shape).astype(np.int16)
+    return np.clip(frame.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+
+
+def test_automatic_side_profile_recovers_rims_depth_and_tilt():
+    engine = AnalysisEngine()
+    frame = make_side_profile_crater_frame()
+    result = engine.analyze_frame(
+        frame,
+        AnalysisSettings(
+            auto_surface=True,
+            left_margin=50,
+            right_margin=50,
+            x_step=3,
+            real_width_mm=180.0,
+        ),
+    )
+
+    assert result.detection_mode == "automatic"
+    assert result.geometry is not None
+    assert 430 <= result.geometry.left_rim[0] <= 590
+    assert 720 <= result.geometry.right_rim[0] <= 850
+    assert 45.0 <= result.metrics.max_crater_depth_px <= 90.0
+    assert 180.0 <= result.metrics.max_crater_width_px <= 420.0
+    assert result.metrics.crater_area_px > 5_000.0
+    assert result.metrics.confidence >= 0.40
+    assert 0.0 <= result.metrics.baseline_tilt_degrees <= 3.0
+
+
+def test_automatic_profile_is_deterministic():
+    engine = AnalysisEngine()
+    frame = make_side_profile_crater_frame()
+    settings = AnalysisSettings(auto_surface=True, x_step=4)
+    first = engine.analyze_frame(frame.copy(), settings)
+    second = engine.analyze_frame(frame.copy(), settings)
+
+    assert first.profile_points == second.profile_points
+    assert first.metrics.to_dict() == second.metrics.to_dict()
+    assert np.array_equal(first.solid_mask, second.solid_mask)

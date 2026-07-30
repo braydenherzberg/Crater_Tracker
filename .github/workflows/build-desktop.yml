@@ -1,34 +1,79 @@
-name: Build Desktop Binaries
+name: Test and Build Desktop Apps
 
 on:
   workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Run regression tests
+        run: pytest -q
+
   build:
+    needs: test
     strategy:
+      fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        include:
+          - os: macos-latest
+            artifact: CraterAnalysis-macOS
+          - os: windows-latest
+            artifact: CraterAnalysis-Windows
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
+      - name: Install build dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Build application
+        run: pyinstaller --name CraterAnalysis --windowed --clean --noconfirm run_desktop.py
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install .[dev]
+      - name: Archive macOS application
+        if: runner.os == 'macOS'
+        run: ditto -c -k --sequesterRsrc --keepParent dist/CraterAnalysis.app ${{ matrix.artifact }}.zip
+      - name: Archive Windows application
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Compress-Archive -Path dist/CraterAnalysis -DestinationPath "${{ matrix.artifact }}.zip"
 
-      - name: Build app
-        run: |
-          pyinstaller --name CraterAnalysis --windowed --noconfirm run_desktop.py
-
-      - name: Upload artifacts
+      - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: crater-${{ matrix.os }}
-          path: dist/
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+          if-no-files-found: error
 
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download platform archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: CraterAnalysis-*
+          merge-multiple: true
+      - name: Create draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --draft --generate-notes ./*.zip
