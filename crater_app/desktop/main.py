@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
@@ -106,6 +107,8 @@ class CraterDashboardWindow(QMainWindow):
         self.analysis_settings = AnalysisSettings()
         self.current_result: Optional[AnalysisResult] = None
         self.current_frame_index = 0
+        self.stabilized_frame_index: Optional[int] = None
+        self.stabilized_frame: Optional[np.ndarray] = None
         self.starred_frames: Dict[int, StarredEntry] = {}
         self.run_fps: float = 30.0
 
@@ -132,84 +135,157 @@ class CraterDashboardWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         central = QWidget()
-        root = QHBoxLayout(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        header = QFrame()
+        header.setObjectName("appHeader")
+        header_row = QHBoxLayout(header)
+        header_row.setContentsMargins(22, 14, 18, 14)
+        brand_col = QVBoxLayout()
+        brand_col.setSpacing(1)
+        brand = QLabel("CRATER")
+        brand.setObjectName("brandLabel")
+        brand_col.addWidget(brand)
+        self.video_name_label = QLabel("No run loaded")
+        self.video_name_label.setObjectName("runLabel")
+        brand_col.addWidget(self.video_name_label)
+        header_row.addLayout(brand_col)
+        header_row.addStretch(1)
+        open_btn = QPushButton("Open video")
+        open_btn.setObjectName("secondaryButton")
+        open_btn.clicked.connect(self._choose_video)
+        header_row.addWidget(open_btn)
+        auto_find_btn = QPushButton("Analyze run")
+        auto_find_btn.setObjectName("primaryButton")
+        auto_find_btn.setToolTip(
+            "Find the experiment event, reject transient low-visibility frames, "
+            "and select a stable crater candidate."
+        )
+        auto_find_btn.clicked.connect(self._auto_find_crater)
+        header_row.addWidget(auto_find_btn)
+        root.addWidget(header)
+
+        workspace = QWidget()
+        workspace_row = QHBoxLayout(workspace)
+        workspace_row.setContentsMargins(16, 16, 16, 16)
+        workspace_row.setSpacing(16)
+
+        viewer = QFrame()
+        viewer.setObjectName("viewer")
+        viewer_col = QVBoxLayout(viewer)
+        viewer_col.setContentsMargins(0, 0, 0, 0)
+        viewer_col.setSpacing(0)
 
         self.video_label = QLabel(
-            "Open a video to begin.\n\nPlease preprocess video first: crop and cut to length."
+            "Open a side-camera run to begin.\n\n"
+            "Automatic analysis will locate the event and select a stable review frame."
         )
         self.video_label.setAlignment(Qt.AlignCenter)
         self.video_label.setMinimumSize(320, 220)
         self.video_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        root.addWidget(self.video_label, 1)
+        self.video_label.setObjectName("videoCanvas")
+        viewer_col.addWidget(self.video_label, 1)
 
-        controls_panel = QWidget()
-        controls_panel.setMinimumWidth(280)
-        controls_panel.setMaximumWidth(420)
-        controls_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        controls_col = QVBoxLayout()
-        controls_panel.setLayout(controls_col)
-
-        controls_scroll = QScrollArea()
-        controls_scroll.setWidgetResizable(True)
-        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        controls_scroll.setWidget(controls_panel)
-        controls_scroll.setMinimumWidth(340)
-        controls_scroll.setMaximumWidth(340)
-        controls_scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        root.addWidget(controls_scroll, 0)
-
-        file_group = QGroupBox("File")
-        file_form = QVBoxLayout(file_group)
-        file_form.setSpacing(4)
-        file_form.setContentsMargins(6, 6, 6, 4)
-        open_btn = QPushButton("Open Video")
-        open_btn.clicked.connect(self._choose_video)
-        file_form.addWidget(open_btn)
-
-        auto_find_btn = QPushButton("Auto Find Crater")
-        auto_find_btn.setToolTip(
-            "Sample the recording and jump to the strongest automatically detected crater."
-        )
-        auto_find_btn.clicked.connect(self._auto_find_crater)
-        file_form.addWidget(auto_find_btn)
-
-        play_row = QHBoxLayout()
+        transport = QFrame()
+        transport.setObjectName("transport")
+        transport_row = QHBoxLayout(transport)
+        transport_row.setContentsMargins(14, 10, 14, 10)
+        transport_row.setSpacing(8)
+        back_btn = QPushButton("−1")
+        back_btn.setToolTip("Previous frame")
+        back_btn.clicked.connect(lambda: self._step_frame(-1))
+        transport_row.addWidget(back_btn)
         self.play_btn = QPushButton("Play")
         self.play_btn.clicked.connect(self._toggle_play)
-        play_row.addWidget(self.play_btn)
-        back_btn = QPushButton("< Back")
-        back_btn.clicked.connect(lambda: self._step_frame(-1))
-        play_row.addWidget(back_btn)
-        forward_btn = QPushButton("Next >")
+        transport_row.addWidget(self.play_btn)
+        forward_btn = QPushButton("+1")
+        forward_btn.setToolTip("Next frame")
         forward_btn.clicked.connect(lambda: self._step_frame(1))
-        play_row.addWidget(forward_btn)
-        file_form.addLayout(play_row)
-
+        transport_row.addWidget(forward_btn)
         self.frame_slider = QSlider(Qt.Horizontal)
         self.frame_slider.setMinimum(0)
         self.frame_slider.setMaximum(0)
         self.frame_slider.valueChanged.connect(self._on_frame_changed)
-        self.frame_slider.hide()
-        file_form.addWidget(self.frame_slider)
-        controls_col.addWidget(file_group)
-        controls_col.setSpacing(4)
+        transport_row.addWidget(self.frame_slider, 1)
+        self.frame_position_label = QLabel("Frame —")
+        self.frame_position_label.setMinimumWidth(150)
+        self.frame_position_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        transport_row.addWidget(self.frame_position_label)
+        viewer_col.addWidget(transport)
+        workspace_row.addWidget(viewer, 1)
 
-        controls_col.addWidget(self._build_analysis_controls())
-        controls_col.addWidget(self._build_starred_frames_panel())
-        controls_col.addWidget(self._build_presets_controls())
-        controls_col.addWidget(self._build_export_controls())
-        controls_col.addWidget(self._build_overlay_controls())
+        controls_panel = QWidget()
+        controls_panel.setMinimumWidth(360)
+        controls_panel.setMaximumWidth(420)
+        controls_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
+        controls_col = QVBoxLayout()
+        controls_col.setContentsMargins(8, 0, 8, 8)
+        controls_col.setSpacing(10)
+        controls_panel.setLayout(controls_col)
+
+        controls_scroll = QScrollArea()
+        controls_scroll.setObjectName("inspector")
+        controls_scroll.setWidgetResizable(True)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        controls_scroll.setWidget(controls_panel)
+        controls_scroll.setMinimumWidth(390)
+        controls_scroll.setMaximumWidth(420)
+        controls_scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        workspace_row.addWidget(controls_scroll, 0)
+        root.addWidget(workspace, 1)
+
+        inspector_title = QLabel("Review & measure")
+        inspector_title.setObjectName("inspectorTitle")
+        controls_col.addWidget(inspector_title)
         controls_col.addWidget(self._build_metrics_panel())
+        controls_col.addWidget(self._build_analysis_controls())
+        controls_col.addWidget(self._build_overlay_controls())
+        controls_col.addWidget(self._build_starred_frames_panel())
+        controls_col.addWidget(self._build_export_controls())
+        controls_col.addWidget(self._build_presets_controls())
         controls_col.addStretch(1)
 
         self.setCentralWidget(central)
+        self._apply_visual_system()
+
+    def _apply_visual_system(self) -> None:
+        self.setStyleSheet(
+            """
+            QMainWindow, QWidget { background: #11161c; color: #dce5ed; font-size: 13px; }
+            #appHeader { background: #171e26; border-bottom: 1px solid #26313c; }
+            #brandLabel { color: #f4f8fb; font-size: 22px; font-weight: 800; letter-spacing: 4px; }
+            #runLabel { color: #8795a3; font-size: 12px; }
+            #viewer { background: #090d11; border: 1px solid #26313c; border-radius: 8px; }
+            #videoCanvas { background: #090d11; color: #6f7e8c; font-size: 15px; }
+            #transport { background: #171e26; border-top: 1px solid #26313c; }
+            #inspector { border: 0; background: #11161c; }
+            #inspectorTitle { color: #f4f8fb; font-size: 20px; font-weight: 700; padding: 5px 0 2px 2px; }
+            QGroupBox { border: 0; border-top: 1px solid #2a3540; margin-top: 14px; padding-top: 12px; font-weight: 700; color: #aebbc7; }
+            QGroupBox::title { subcontrol-origin: margin; left: 0; padding: 0 7px 0 0; }
+            QPushButton { background: #202a34; border: 1px solid #33414e; border-radius: 5px; padding: 7px 11px; color: #e7edf2; }
+            QPushButton:hover { background: #293641; border-color: #4b5d6d; }
+            QPushButton:disabled { color: #596673; background: #171d24; border-color: #26303a; }
+            #primaryButton { background: #25a7c6; border-color: #25a7c6; color: #071116; font-weight: 800; padding: 9px 16px; }
+            #primaryButton:hover { background: #49bdd6; }
+            #secondaryButton { padding: 9px 14px; }
+            QComboBox, QDoubleSpinBox { background: #171e26; border: 1px solid #33414e; border-radius: 4px; padding: 5px; }
+            QListWidget { background: #0e1318; border: 1px solid #2a3540; border-radius: 4px; }
+            QScrollBar:vertical { background: #11161c; width: 10px; }
+            QScrollBar::handle:vertical { background: #364552; border-radius: 5px; min-height: 28px; }
+            QSlider::groove:horizontal { height: 4px; background: #34414c; border-radius: 2px; }
+            QSlider::handle:horizontal { background: #25a7c6; width: 14px; margin: -5px 0; border-radius: 7px; }
+            QCheckBox { spacing: 8px; }
+            """
+        )
 
     def _build_analysis_controls(self) -> QGroupBox:
-        group = QGroupBox("Analysis Controls")
+        group = QGroupBox("Detection")
         form = QFormLayout(group)
         form.setRowWrapPolicy(QFormLayout.DontWrapRows)
 
-        self.auto_surface_check = QCheckBox("Automatic side-profile tracking")
+        self.auto_surface_check = QCheckBox("Automatic surface tracking")
         self.auto_surface_check.setChecked(self.analysis_settings.auto_surface)
         self.auto_surface_check.setToolTip(
             "Automatically trace the material/air boundary and infer crater rims, "
@@ -267,24 +343,31 @@ class CraterDashboardWindow(QMainWindow):
         self.tilt_slider.setToolTip("Tilt angle (-7 to +7 in 0.25 degree steps)")
 
         form.addRow(self.auto_surface_check)
-        form.addRow(self._form_label("Threshold"), threshold_row)
-        form.addRow(self._form_label("Smoothing"), smoothing_row)
-        form.addRow(self._form_label("Despeckle"), despeckle_row)
         form.addRow(self._form_label("Channel"), self.channel_combo)
-        form.addRow(self._form_label("Crater Left Boundary"), zone_left_row)
-        form.addRow(self._form_label("Crater Right Boundary"), zone_right_row)
-        form.addRow(self._form_label("Surface Boundary"), surface_row)
-        form.addRow(self._form_label("Scan Mode"), self.scan_toggle)
         form.addRow(self._form_label("Tilt (-7..+7, 0.25)"), tilt_row)
         form.addRow(self._form_label("Real Width (mm)"), self.real_width_spin)
+
+        self.manual_controls_container = QWidget()
+        manual_form = QFormLayout(self.manual_controls_container)
+        manual_form.setContentsMargins(0, 8, 0, 0)
+        manual_form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+        manual_form.addRow(self._form_label("Threshold"), threshold_row)
+        manual_form.addRow(self._form_label("Smoothing"), smoothing_row)
+        manual_form.addRow(self._form_label("Despeckle"), despeckle_row)
+        manual_form.addRow(self._form_label("Crater Left Boundary"), zone_left_row)
+        manual_form.addRow(self._form_label("Crater Right Boundary"), zone_right_row)
+        manual_form.addRow(self._form_label("Surface Boundary"), surface_row)
+        manual_form.addRow(self._form_label("Scan Mode"), self.scan_toggle)
+        self.manual_controls_container.setVisible(not self.analysis_settings.auto_surface)
+        form.addRow(self.manual_controls_container)
         self._update_scan_mode_label()
         return group
 
     def _build_overlay_controls(self) -> QGroupBox:
-        group = QGroupBox("Overlay")
+        group = QGroupBox("View")
         layout = QVBoxLayout(group)
         self.show_mask = QCheckBox("Show Mask Panel")
-        self.show_mask.setChecked(True)
+        self.show_mask.setChecked(False)
         self.show_mask.setToolTip("Show/hide the lower binary mask preview panel.")
         self.show_mask.stateChanged.connect(self._render_current)
         self.show_guides = QCheckBox("Show Guides")
@@ -295,7 +378,19 @@ class CraterDashboardWindow(QMainWindow):
         self.show_profile.setChecked(True)
         self.show_profile.setToolTip("Show/hide the green traced crater profile.")
         self.show_profile.stateChanged.connect(self._render_current)
-        for widget in (self.show_mask, self.show_guides, self.show_profile):
+        self.show_enhanced = QCheckBox("Enhance low contrast")
+        self.show_enhanced.setChecked(False)
+        self.show_enhanced.setToolTip(
+            "Apply local contrast enhancement to the review image only. "
+            "Measurements continue to use source pixels."
+        )
+        self.show_enhanced.stateChanged.connect(self._render_current)
+        for widget in (
+            self.show_mask,
+            self.show_guides,
+            self.show_profile,
+            self.show_enhanced,
+        ):
             layout.addWidget(widget)
 
         self.guide_left_slider, self.guide_left_label, guide_left_row = self._slider_control(
@@ -319,11 +414,12 @@ class CraterDashboardWindow(QMainWindow):
         return group
 
     def _build_starred_frames_panel(self) -> QGroupBox:
-        group = QGroupBox("Starred Frames")
+        group = QGroupBox("Accepted measurements")
         layout = QVBoxLayout(group)
 
         btn_row = QHBoxLayout()
-        self.star_btn = QPushButton("Star Frame")
+        self.star_btn = QPushButton("Accept current")
+        self.star_btn.setEnabled(False)
         self.star_btn.setToolTip("Bookmark this frame with current settings/profile for export.")
         self.star_btn.clicked.connect(self._star_current_frame)
         btn_row.addWidget(self.star_btn)
@@ -372,7 +468,7 @@ class CraterDashboardWindow(QMainWindow):
         self.starred_list.setToolTip("Click a frame to jump to it and load its saved settings.")
         layout.addWidget(self.starred_list)
 
-        self.starred_count_label = QLabel("0 frames starred")
+        self.starred_count_label = QLabel("0 accepted frames")
         layout.addWidget(self.starred_count_label)
         self._refresh_sessions_list()
         return group
@@ -444,11 +540,17 @@ class CraterDashboardWindow(QMainWindow):
         return group
 
     def _build_metrics_panel(self) -> QGroupBox:
-        group = QGroupBox("Metrics")
+        group = QGroupBox("Candidate")
         layout = QVBoxLayout(group)
         self.metrics_label = QLabel("No metrics yet.")
         self.metrics_label.setWordWrap(True)
         layout.addWidget(self.metrics_label)
+        self.analysis_note_label = QLabel(
+            "Open a run, then select Analyze run."
+        )
+        self.analysis_note_label.setWordWrap(True)
+        self.analysis_note_label.setStyleSheet("color: #7f8e9b; font-size: 12px;")
+        layout.addWidget(self.analysis_note_label)
         return group
 
     def _slider_control(self, lo: int, hi: int, value: int) -> tuple[QSlider, QLabel, QWidget]:
@@ -493,6 +595,12 @@ class CraterDashboardWindow(QMainWindow):
                 self.video.release()
             self.video = VideoReader(path)
             self.current_video_path = path
+            self.video_name_label.setText(Path(path).name)
+            self.stabilized_frame_index = None
+            self.stabilized_frame = None
+            self.analysis_note_label.setText(
+                "Single-frame preview. Select Analyze run for event-aware review."
+            )
             self.run_fps = self.video.fps
             self.fps_label.setText(f"FPS: {self.run_fps:.3f}")
             self.current_frame_index = 0
@@ -537,6 +645,11 @@ class CraterDashboardWindow(QMainWindow):
 
     def _on_frame_changed(self, value: int) -> None:
         self.current_frame_index = value
+        if self.video is not None:
+            seconds = value / max(0.001, self.video.fps)
+            self.frame_position_label.setText(
+                f"Frame {value:,}  ·  {seconds:.2f} s"
+            )
         self._render_current()
 
     def _sync_settings(self) -> None:
@@ -584,12 +697,21 @@ class CraterDashboardWindow(QMainWindow):
             self.scan_toggle,
         ):
             widget.setEnabled(not self.analysis_settings.auto_surface)
+        self.manual_controls_container.setVisible(
+            not self.analysis_settings.auto_surface
+        )
         self._render_current()
 
     def _render_current(self) -> None:
         if self.video is None:
             return
-        frame = self.video.get_frame_copy(self.current_frame_index)
+        if (
+            self.stabilized_frame_index == self.current_frame_index
+            and self.stabilized_frame is not None
+        ):
+            frame = self.stabilized_frame.copy()
+        else:
+            frame = self.video.get_frame_copy(self.current_frame_index)
         if frame is None:
             actual_max = max(0, self.video.frame_count - 1)
             if self.current_frame_index > actual_max:
@@ -612,8 +734,39 @@ class CraterDashboardWindow(QMainWindow):
         )
         self._update_metrics(self.current_result)
 
+    def _build_temporally_stabilized_frame(
+        self, frame_index: int
+    ) -> Optional[np.ndarray]:
+        if self.video is None:
+            return None
+        offsets = (-12, -8, -4, 0, 4, 8, 12)
+        frames = []
+        for offset in offsets:
+            index = min(
+                self.video.frame_count - 1,
+                max(0, frame_index + offset),
+            )
+            frame = self.video.get_frame_copy(index)
+            if frame is not None:
+                frames.append(frame)
+        if not frames:
+            return None
+        if len(frames) == 1:
+            return frames[0]
+        return np.median(np.stack(frames), axis=0).astype(np.uint8)
+
     def _compose_result(self, result: AnalysisResult, settings: AnalysisSettings) -> np.ndarray:
         current_frame = result.frame.copy()
+        if self.show_enhanced.isChecked():
+            lab = cv2.cvtColor(current_frame, cv2.COLOR_BGR2LAB)
+            lightness, channel_a, channel_b = cv2.split(lab)
+            lightness = cv2.createCLAHE(
+                clipLimit=2.2, tileGridSize=(12, 8)
+            ).apply(lightness)
+            current_frame = cv2.cvtColor(
+                cv2.merge((lightness, channel_a, channel_b)),
+                cv2.COLOR_LAB2BGR,
+            )
         mask_display = cv2.cvtColor(result.solid_mask, cv2.COLOR_GRAY2BGR)
         h, w, _ = current_frame.shape
         center_x = w // 2
@@ -703,9 +856,31 @@ class CraterDashboardWindow(QMainWindow):
                     f"Cross-section area: {area_mm2:.2f} mm²  ({m.crater_area_px:.1f} px²)",
                     f"Baseline tilt: {m.baseline_tilt_degrees:+.2f}°",
                     f"Confidence: {m.confidence:.0%}",
+                    (
+                        f"Surface visibility: {result.geometry.profile_confidence:.0%}"
+                        if result.geometry is not None
+                        else "Surface visibility: unavailable"
+                    ),
                 ]
             )
         )
+        self.star_btn.setEnabled(
+            result.detection_mode == "manual"
+            or (
+                result.geometry is not None
+                and result.metrics.confidence >= 0.42
+                and result.geometry.profile_confidence >= 0.35
+            )
+        )
+        if self.star_btn.isEnabled():
+            self.star_btn.setToolTip(
+                "Accept this reviewed frame and geometry for export."
+            )
+        else:
+            self.star_btn.setToolTip(
+                "Acceptance is disabled because the automatic evidence is weak. "
+                "Try contrast/channel controls or switch to manual mode."
+            )
 
     def _star_current_frame(self) -> None:
         if self.video is None or self.current_result is None:
@@ -834,6 +1009,7 @@ class CraterDashboardWindow(QMainWindow):
         best_index: Optional[int] = None
         best_status = ""
         candidate_rows = []
+        scan_rows = []
         for position, frame_index in enumerate(indices, start=1):
             progress.setValue(position - 1)
             progress.setLabelText(
@@ -845,7 +1021,13 @@ class CraterDashboardWindow(QMainWindow):
             frame = self.video.get_frame_copy(int(frame_index))
             if frame is None:
                 continue
+            thumb = cv2.cvtColor(
+                cv2.resize(frame, (320, 180), interpolation=cv2.INTER_AREA),
+                cv2.COLOR_BGR2GRAY,
+            )
+            thumb = cv2.GaussianBlur(thumb, (7, 7), 0)
             candidate = self.engine.analyze_frame(frame, self.analysis_settings)
+            scan_rows.append((int(frame_index), thumb, candidate))
             width = candidate.metrics.max_crater_width_px
             depth = candidate.metrics.max_crater_depth_px
             if (
@@ -858,17 +1040,70 @@ class CraterDashboardWindow(QMainWindow):
                 depth
                 * (0.25 + candidate.metrics.confidence)
             )
-            candidate_rows.append((score, int(frame_index), candidate))
+            candidate_rows.append((score, int(frame_index), candidate, thumb))
         progress.setValue(len(indices))
 
-        if candidate_rows:
-            # Favor a crater geometry that persists across neighboring samples.
-            # This reduces selection of one-frame dust, glare, or codec artifacts.
+        event_frame = 0
+        reference_thumb = None
+        if scan_rows:
+            reference_count = max(1, min(5, len(scan_rows) // 10))
+            reference_thumb = np.median(
+                np.stack([row[1] for row in scan_rows[:reference_count]]),
+                axis=0,
+            ).astype(np.float32)
+            motion_rows = []
+            for row_index in range(1, len(scan_rows)):
+                previous = scan_rows[row_index - 1][1].astype(np.float32)
+                current = scan_rows[row_index][1].astype(np.float32)
+                delta = current - previous
+                delta -= float(np.median(delta))
+                # Favor the material/air region and ignore most overhead hardware.
+                score = float(np.mean(np.abs(delta[35:125, 10:310])))
+                motion_rows.append((score, row_index))
+            if motion_rows:
+                motion_values = np.asarray([row[0] for row in motion_rows])
+                high_motion = float(np.percentile(motion_values, 90))
+                earliest_search = max(1, int(len(scan_rows) * 0.08))
+                event_candidates = [
+                    row
+                    for row in motion_rows
+                    if row[1] >= earliest_search and row[0] >= high_motion
+                ]
+                if event_candidates:
+                    # The first major transition is normally the experiment;
+                    # later camera handling should not replace it.
+                    _, event_position = min(event_candidates, key=lambda row: row[1])
+                    event_frame = scan_rows[event_position][0]
+
+        sample_gap = max(1, int(self.video.frame_count / max(1, sample_count)))
+        post_event_rows = [
+            row
+            for row in candidate_rows
+            if row[1] >= event_frame + sample_gap
+            and row[2].geometry is not None
+            and row[2].geometry.profile_confidence >= 0.45
+        ]
+        rows_to_rank = post_event_rows or candidate_rows
+
+        if rows_to_rank:
+            # Require temporal change and favor geometry that persists across
+            # neighboring post-event samples. Static pre-run mounds, transient
+            # dust edges, and glare should not win on shape alone.
+            change_values = []
+            if reference_thumb is not None:
+                for _, _, _, thumb in rows_to_rank:
+                    delta = thumb.astype(np.float32) - reference_thumb
+                    delta -= float(np.median(delta))
+                    change_values.append(
+                        float(np.mean(np.abs(delta[35:125, 10:310])))
+                    )
+            change_low = float(np.percentile(change_values, 15)) if change_values else 0.0
+            change_high = float(np.percentile(change_values, 90)) if change_values else 1.0
             ranked_rows = []
-            for score, frame_index, candidate in candidate_rows:
+            for row_number, (score, frame_index, candidate, _) in enumerate(rows_to_rank):
                 metric = candidate.metrics
                 support = 0
-                for _, other_index, other in candidate_rows:
+                for _, other_index, other, _ in rows_to_rank:
                     if other_index == frame_index:
                         continue
                     if abs(other_index - frame_index) > max(
@@ -885,22 +1120,47 @@ class CraterDashboardWindow(QMainWindow):
                     if center_close and width_close:
                         support += 1
                 stability_multiplier = 0.70 + min(0.60, support * 0.15)
+                if change_values:
+                    change_signal = float(
+                        np.clip(
+                            (change_values[row_number] - change_low)
+                            / max(0.001, change_high - change_low),
+                            0.0,
+                            1.0,
+                        )
+                    )
+                else:
+                    change_signal = 1.0
+                temporal_multiplier = 0.15 + (0.85 * change_signal)
                 ranked_rows.append(
-                    (score * stability_multiplier, frame_index, candidate)
+                    (
+                        score * stability_multiplier * temporal_multiplier,
+                        frame_index,
+                        candidate,
+                    )
                 )
             _, best_index, best_candidate = max(ranked_rows, key=lambda row: row[0])
-            best_status = best_candidate.status
+            best_status = f"Post-event · {best_candidate.status}"
 
         if best_index is None:
             QMessageBox.warning(
                 self,
-                "Auto Find Crater",
-                "No crater candidate was found. Try manual mode or adjust the guide margins.",
+                "Analyze Run",
+                "No stable post-event crater candidate was found. "
+                "Review the event manually or adjust the view controls.",
             )
             return
+        self.stabilized_frame_index = best_index
+        self.stabilized_frame = self._build_temporally_stabilized_frame(best_index)
+        self.analysis_note_label.setText(
+            f"Event-aware selection near frame {event_frame:,}. "
+            "Review uses a 7-frame temporal median to suppress moving dust and glare."
+        )
         self.frame_slider.setValue(best_index)
+        if self.current_frame_index == best_index:
+            self._render_current()
         self.statusBar().showMessage(
-            f"Best sampled candidate: frame {best_index:,} — {best_status}",
+            f"Selected frame {best_index:,} after event near frame {event_frame:,} — {best_status}",
             10000,
         )
 
@@ -913,7 +1173,9 @@ class CraterDashboardWindow(QMainWindow):
             item.setData(Qt.UserRole, idx)
             self.starred_list.addItem(item)
         count = len(self.starred_frames)
-        self.starred_count_label.setText(f"{count} frame{'s' if count != 1 else ''} starred")
+        self.starred_count_label.setText(
+            f"{count} accepted frame{'s' if count != 1 else ''}"
+        )
 
     def _refresh_presets_list(self) -> None:
         names = [p.name for p in list_presets(self.preset_dir)]

@@ -106,7 +106,10 @@ def _find_crater_geometry(
     ).ravel().astype(np.float64)
     residual = _smooth_1d(np.maximum(fine - opened, 0.0), max(5, int(count * 0.02)))
 
-    edge = max(2, int(count * 0.05))
+    # Keep candidate rims well inside the tracked span. Transparent container
+    # walls create strong vertical steps near both sides and must never serve
+    # as a physical crater rim.
+    edge = max(2, int(count * 0.08))
     searchable = residual.copy()
     searchable[:edge] = 0.0
     searchable[-edge:] = 0.0
@@ -189,6 +192,7 @@ def _find_crater_geometry(
         np.clip(1.0 - max(0.0, abs(baseline_tilt_degrees) - 8.0) / 20.0, 0.0, 1.0)
     )
     geometry_confidence *= 0.25 + (0.75 * tilt_plausibility)
+    geometry_confidence *= 0.30 + (0.70 * edge_confidence)
     if geometry_confidence >= 0.72:
         status = "Strong crater candidate"
     elif geometry_confidence >= 0.42:
@@ -263,10 +267,23 @@ def extract_auto_profile(
     for x, center in enumerate(guide_y.astype(int)):
         lo = max(search_top, center - search_radius)
         hi = min(search_bottom, center + search_radius + 1)
-        local_index = int(np.argmax(response[lo:hi, x]))
+        rows = np.arange(lo, hi, dtype=np.float32)
+        local_scores = response[lo:hi, x] - (
+            np.abs(rows - float(center)) * 0.65
+        )
+        local_index = int(np.argmax(local_scores))
         picked_y[x] = lo + local_index
         picked_score[x] = response[lo + local_index, x]
 
+    local_median = _rolling_median(
+        picked_y, max(9, int(working_w * 0.035))
+    )
+    outlier_limit = max(5.0, working_h * 0.018)
+    picked_y = np.where(
+        np.abs(picked_y - local_median) > outlier_limit,
+        local_median,
+        picked_y,
+    )
     picked_y = _smooth_1d(picked_y, max(7, int(working_w * 0.035)))
     score_low, score_high = np.percentile(picked_score, [15, 85])
     edge_confidence = float(

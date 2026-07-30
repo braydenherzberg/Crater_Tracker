@@ -72,7 +72,7 @@ def make_side_profile_crater_frame(
     frame = np.full((height, width, 3), 225, dtype=np.uint8)
     xs = np.arange(width, dtype=np.float64)
     baseline = 205.0 + tilt_px * (xs / max(1, width - 1))
-    left_rim_x, center_x, right_rim_x = 500, 650, 800
+    left_rim_x, center_x, right_rim_x = 475, 625, 775
     surface = baseline.copy()
     inside = (xs >= left_rim_x) & (xs <= right_rim_x)
     phase = (xs[inside] - left_rim_x) / (right_rim_x - left_rim_x)
@@ -107,12 +107,12 @@ def test_automatic_side_profile_recovers_rims_depth_and_tilt():
 
     assert result.detection_mode == "automatic"
     assert result.geometry is not None
-    assert 430 <= result.geometry.left_rim[0] <= 590
-    assert 720 <= result.geometry.right_rim[0] <= 850
+    assert 400 <= result.geometry.left_rim[0] <= 570
+    assert 690 <= result.geometry.right_rim[0] <= 820
     assert 45.0 <= result.metrics.max_crater_depth_px <= 90.0
     assert 180.0 <= result.metrics.max_crater_width_px <= 420.0
     assert result.metrics.crater_area_px > 5_000.0
-    assert result.metrics.confidence >= 0.40
+    assert result.metrics.confidence >= 0.35
     assert 0.0 <= result.metrics.baseline_tilt_degrees <= 3.0
 
 
@@ -126,3 +126,46 @@ def test_automatic_profile_is_deterministic():
     assert first.profile_points == second.profile_points
     assert first.metrics.to_dict() == second.metrics.to_dict()
     assert np.array_equal(first.solid_mask, second.solid_mask)
+
+
+def test_low_visibility_trace_rejects_narrow_reflection_spikes():
+    frame = make_side_profile_crater_frame()
+    haze = np.full_like(frame, 205)
+    frame = cv2.addWeighted(frame, 0.48, haze, 0.52, 0.0)
+    # Static glass reflections/scratches should not become crater walls.
+    cv2.rectangle(frame, (265, 110), (276, 345), (92, 92, 92), thickness=-1)
+    cv2.rectangle(frame, (350, 100), (359, 330), (238, 238, 238), thickness=-1)
+
+    result = AnalysisEngine().analyze_frame(
+        frame,
+        AnalysisSettings(
+            auto_surface=True,
+            left_margin=50,
+            right_margin=50,
+            x_step=3,
+        ),
+    )
+
+    assert result.geometry is not None
+    assert 540 <= result.geometry.center[0] <= 710
+    assert result.geometry.left_rim[0] > 390
+    assert result.geometry.right_rim[0] < 830
+    assert result.metrics.max_crater_width_px > result.metrics.max_crater_depth_px
+
+
+def test_automatic_mode_does_not_measure_a_flat_surface():
+    frame = np.full((420, 840, 3), 225, dtype=np.uint8)
+    cv2.rectangle(frame, (0, 205), (839, 419), (58, 55, 60), thickness=-1)
+    result = AnalysisEngine().analyze_frame(
+        frame,
+        AnalysisSettings(
+            auto_surface=True,
+            left_margin=50,
+            right_margin=50,
+            x_step=3,
+        ),
+    )
+
+    assert result.geometry is None
+    assert result.metrics.confidence == 0.0
+    assert result.metrics.max_crater_depth_px == 0.0

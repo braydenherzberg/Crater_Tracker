@@ -12,7 +12,8 @@ do not leave the computer.
 - Automatic material/air surface tracking
 - Automatic crater basin, rim, center, and local baseline inference
 - Rim-to-rim width, maximum depth, cross-section area, baseline tilt, and confidence
-- Automatic sampling of long recordings to find a strong crater candidate
+- Event-aware sampling of long recordings with post-event candidate selection
+- Seven-frame temporal median review for low-visibility dust and glare
 - Source-video FPS detection and calibrated millimeter exports
 - Manual threshold/scan mode as a fallback for difficult footage
 - Frame playback, scrubbing, overlays, bookmarks, presets, and saved sessions
@@ -42,7 +43,8 @@ python run_desktop.py
 1. Open a side-camera video.
 2. Enter the real width represented by the **full video frame**.
 3. Leave **Automatic side-profile tracking** enabled.
-4. For long recordings, select **Auto Find Crater**.
+4. Select **Analyze run** to locate the experiment event and review a stable
+   post-event frame.
 5. Inspect the green trace, blue rim markers/baseline, confidence, and units.
 6. If the trace is wrong, adjust guide margins/channel/tilt or switch to manual mode.
 7. Star accepted frames and export profiles or measurements.
