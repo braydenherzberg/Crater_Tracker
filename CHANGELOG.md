@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.4.0
+
+- Added on-canvas crater-line annotation with left-to-right control points.
+- Added saved guide keyframes and temporal curve interpolation between them.
+- Added conservative local edge tracking constrained to 14 pixels around the guide.
+- Made guided tracking the default and suppressed all crater metrics until an
+  operator defines the intended physical interface.
+- Defined guided rim points from curve endpoints and the depth from their local baseline.
+- Persisted guide keyframes in saved analysis sessions.
+- Added regression tests for guided measurement and spatial/temporal interpolation.
+- Reclassified the old automatic surface detector as unverified for the supplied
+  low-visibility videos instead of presenting its output as a crater measurement.
+
 ## 0.3.0
 
 - Replaced shape-only run selection with event-aware post-event ranking.

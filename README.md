@@ -9,8 +9,10 @@ do not leave the computer.
 
 ## Current capabilities
 
-- Automatic material/air surface tracking
-- Automatic crater basin, rim, center, and local baseline inference
+- Operator-guided crater-line keyframes on the video canvas
+- Spatial interpolation between sparse clicks and temporal interpolation between keyframes
+- Conservative local edge refinement that cannot leave the user-defined search corridor
+- Explicit no-measurement state until the physical crater interface is defined
 - Rim-to-rim width, maximum depth, cross-section area, baseline tilt, and confidence
 - Event-aware sampling of long recordings with post-event candidate selection
 - Seven-frame temporal median review for low-visibility dust and glare
@@ -20,11 +22,11 @@ do not leave the computer.
 - Snapshot, profile CSV, metrics CSV, and headless batch export
 - macOS and Windows packaging scripts
 
-Automatic results remain reviewable. The app draws:
+The guided workflow draws:
 
-- **Green:** detected full material surface
-- **Orange:** measured crater segment
-- **Blue:** inferred rim-to-rim baseline and rim markers
+- **Magenta:** the operator's clicked control points and line
+- **Green/orange:** the dense tracked crater curve
+- **Blue:** endpoint-to-endpoint baseline and rim markers
 - **Red:** deepest detected point
 
 ## Run from source
@@ -42,19 +44,23 @@ python run_desktop.py
 
 1. Open a side-camera video.
 2. Enter the real width represented by the **full video frame**.
-3. Leave **Automatic side-profile tracking** enabled.
+3. Leave **Use guided tracking** enabled.
 4. Select **Analyze run** to locate the experiment event and review a stable
    post-event frame.
-5. Inspect the green trace, blue rim markers/baseline, confidence, and units.
-6. If the trace is wrong, adjust guide margins/channel/tilt or switch to manual mode.
-7. Star accepted frames and export profiles or measurements.
+5. Select **Draw line on this frame** and click left-to-right from the true left
+   rim, through the crater floor, to the true right rim. Save the keyframe.
+6. Scrub through the run. Add another keyframe wherever the interpolated line
+   stops following the same physical interface.
+7. Inspect the tracked curve and baseline, then accept frames for export.
 
 Confidence is a quality heuristic, not a scientific uncertainty interval.
 Measurements should not be accepted unless the overlay follows the physical
 surface and the inferred rim-to-rim baseline is plausible.
 
-Automatic statuses deliberately say **candidate**: the software cannot establish
-from pixels alone that a traced basin is the intended physical crater.
+The legacy automatic surface detector remains available when guided tracking is
+disabled, but it is not a verified crater detector for the supplied low-visibility
+runs. It can select a visually strong material/air boundary that is not the
+intended physical crater. Do not treat its measurements as validated ground truth.
 
 ## Batch analysis
 
@@ -76,8 +82,8 @@ An optional JSON settings file may be supplied with `--settings-json`.
 pytest -q
 ```
 
-The regression suite includes deterministic manual analysis and automatic
-recovery of a tilted synthetic crater with known geometry.
+The regression suite includes deterministic manual analysis, synthetic automatic
+surface recovery, guided geometry, and interpolation between guide keyframes.
 
 ## Packaging
 

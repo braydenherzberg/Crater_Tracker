@@ -2,6 +2,7 @@ import cv2
 import numpy as np
 
 from crater_app.core.analysis import AnalysisEngine
+from crater_app.core.guided_profile import densify_guide, interpolate_guides
 from crater_app.core.settings import AnalysisSettings
 
 
@@ -169,3 +170,43 @@ def test_automatic_mode_does_not_measure_a_flat_surface():
     assert result.geometry is None
     assert result.metrics.confidence == 0.0
     assert result.metrics.max_crater_depth_px == 0.0
+
+
+def test_sparse_operator_clicks_define_guided_crater_geometry():
+    frame = make_side_profile_crater_frame()
+    clicks = [(470, 205), (560, 246), (625, 278), (700, 248), (780, 215)]
+    result = AnalysisEngine().analyze_guided_frame(
+        frame,
+        AnalysisSettings(auto_surface=True, x_step=3),
+        clicks,
+        is_keyframe=True,
+        snap_to_edge=False,
+    )
+
+    assert result.detection_mode == "guided"
+    assert result.geometry is not None
+    assert result.geometry.left_rim[0] == 470
+    assert result.geometry.right_rim[0] == 780
+    assert 55.0 <= result.metrics.max_crater_depth_px <= 75.0
+    assert result.metrics.max_crater_width_px == 310.0
+    assert result.status.startswith("Guided keyframe")
+
+
+def test_guides_fill_click_gaps_and_interpolate_between_frames():
+    keyframes = {
+        10: [(100, 150), (200, 210), (300, 150)],
+        30: [(120, 160), (220, 240), (320, 160)],
+    }
+    curve, temporal_distance, is_keyframe = interpolate_guides(keyframes, 20, 4)
+
+    assert not is_keyframe
+    assert temporal_distance == 0.5
+    assert curve[0] == (110, 155)
+    assert curve[-1] == (310, 155)
+    assert max(y for _, y in curve) >= 220
+    assert len(curve) > len(keyframes[10])
+
+    dense = densify_guide([(30, 100), (50, 120), (70, 100)], 2)
+    assert dense[0] == (30, 100)
+    assert dense[-1] == (70, 100)
+    assert len(dense) == 21

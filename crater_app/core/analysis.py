@@ -8,6 +8,7 @@ import numpy as np
 
 from .auto_profile import CraterGeometry, extract_auto_profile
 from .crater_profile import extract_profile_points
+from .guided_profile import densify_guide, geometry_from_guide, snap_guide_to_local_edge
 from .metrics import CraterMetrics, compute_geometry_metrics, compute_metrics
 from .preprocess import build_solid_mask, rotate_frame, select_channel
 from .settings import AnalysisSettings
@@ -67,4 +68,53 @@ class AnalysisEngine:
             metrics=metrics,
             detection_mode="manual",
             status="Manual profile",
+        )
+
+    def analyze_guided_frame(
+        self,
+        frame: np.ndarray,
+        settings: AnalysisSettings,
+        guide_points: List[Tuple[int, int]],
+        *,
+        is_keyframe: bool,
+        snap_to_edge: bool = True,
+    ) -> AnalysisResult:
+        """Analyze only the crater interface supplied by the operator."""
+
+        normalized = settings.normalized(frame.shape[0])
+        rotated = rotate_frame(frame, normalized.tilt_degrees)
+        dense_guide = densify_guide(guide_points, normalized.x_step)
+        if snap_to_edge:
+            profile, evidence = snap_guide_to_local_edge(
+                rotated, dense_guide, normalized
+            )
+        else:
+            profile, evidence = dense_guide, 0.0
+        geometry = geometry_from_guide(profile, evidence, is_keyframe)
+        if geometry is None:
+            metrics = compute_metrics([], normalized.surface_boundary)
+            mask = np.zeros(rotated.shape[:2], dtype=np.uint8)
+            status = "Add at least three points along the crater line"
+        else:
+            metrics = compute_geometry_metrics(
+                geometry.crater_points,
+                geometry.baseline_points,
+                geometry.geometry_confidence,
+            )
+            mask = np.zeros(rotated.shape[:2], dtype=np.uint8)
+            polygon = [
+                (geometry.crater_points[0][0], rotated.shape[0] - 1),
+                *geometry.crater_points,
+                (geometry.crater_points[-1][0], rotated.shape[0] - 1),
+            ]
+            cv2.fillPoly(mask, [np.asarray(polygon, dtype=np.int32)], 255)
+            status = geometry.status
+        return AnalysisResult(
+            frame=rotated,
+            solid_mask=mask,
+            profile_points=profile,
+            metrics=metrics,
+            geometry=geometry,
+            detection_mode="guided",
+            status=status,
         )

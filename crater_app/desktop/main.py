@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtCore import QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from crater_app.core.analysis import AnalysisEngine, AnalysisResult
+from crater_app.core.guided_profile import interpolate_guides
 from crater_app.core.metrics import compute_geometry_metrics, compute_metrics
 from crater_app.core.settings import AnalysisSettings
 from crater_app.core.video_reader import VideoReader
@@ -79,6 +80,16 @@ def frame_to_pixmap(frame_bgr: np.ndarray) -> QPixmap:
     return QPixmap.fromImage(image)
 
 
+class AnnotatableVideoLabel(QLabel):
+    clicked = Signal(int, int)
+
+    def mousePressEvent(self, event):  # type: ignore[override]
+        if event.button() == Qt.LeftButton:
+            position = event.position()
+            self.clicked.emit(int(position.x()), int(position.y()))
+        super().mousePressEvent(event)
+
+
 class CraterDashboardWindow(QMainWindow):
     LABEL_TOOLTIPS: Dict[str, str] = {
         "Threshold": "Binary threshold used to separate crater/solid pixels from background.",
@@ -110,6 +121,10 @@ class CraterDashboardWindow(QMainWindow):
         self.stabilized_frame_index: Optional[int] = None
         self.stabilized_frame: Optional[np.ndarray] = None
         self.starred_frames: Dict[int, StarredEntry] = {}
+        self.guide_keyframes: Dict[int, List[Tuple[int, int]]] = {}
+        self.guide_drafts: Dict[int, List[Tuple[int, int]]] = {}
+        self._composed_shape: Optional[Tuple[int, int]] = None
+        self._source_frame_height = 0
         self.run_fps: float = 30.0
 
         self.preset_dir = default_preset_dir()
@@ -178,7 +193,7 @@ class CraterDashboardWindow(QMainWindow):
         viewer_col.setContentsMargins(0, 0, 0, 0)
         viewer_col.setSpacing(0)
 
-        self.video_label = QLabel(
+        self.video_label = AnnotatableVideoLabel(
             "Open a side-camera run to begin.\n\n"
             "Automatic analysis will locate the event and select a stable review frame."
         )
@@ -186,6 +201,7 @@ class CraterDashboardWindow(QMainWindow):
         self.video_label.setMinimumSize(320, 220)
         self.video_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.video_label.setObjectName("videoCanvas")
+        self.video_label.clicked.connect(self._add_guide_point_from_view)
         viewer_col.addWidget(self.video_label, 1)
 
         transport = QFrame()
@@ -240,6 +256,7 @@ class CraterDashboardWindow(QMainWindow):
         inspector_title.setObjectName("inspectorTitle")
         controls_col.addWidget(inspector_title)
         controls_col.addWidget(self._build_metrics_panel())
+        controls_col.addWidget(self._build_guided_tracking_panel())
         controls_col.addWidget(self._build_analysis_controls())
         controls_col.addWidget(self._build_overlay_controls())
         controls_col.addWidget(self._build_starred_frames_panel())
@@ -270,6 +287,8 @@ class CraterDashboardWindow(QMainWindow):
             #primaryButton { background: #25a7c6; border-color: #25a7c6; color: #071116; font-weight: 800; padding: 9px 16px; }
             #primaryButton:hover { background: #49bdd6; }
             #secondaryButton { padding: 9px 14px; }
+            #guideButton:checked { background: #d5a72d; border-color: #f0c54b; color: #11161c; font-weight: 800; }
+            #guideHint { color: #94a2af; font-size: 12px; line-height: 1.3; }
             QComboBox, QDoubleSpinBox { background: #171e26; border: 1px solid #33414e; border-radius: 4px; padding: 5px; }
             QListWidget { background: #0e1318; border: 1px solid #2a3540; border-radius: 4px; }
             QScrollBar:vertical { background: #11161c; width: 10px; }
@@ -280,13 +299,76 @@ class CraterDashboardWindow(QMainWindow):
             """
         )
 
+    def _build_guided_tracking_panel(self) -> QGroupBox:
+        group = QGroupBox("Guided crater line")
+        layout = QVBoxLayout(group)
+        self.guided_tracking_check = QCheckBox("Use guided tracking")
+        self.guided_tracking_check.setChecked(True)
+        self.guided_tracking_check.setToolTip(
+            "Require operator-defined crater lines instead of guessing which visible interface is the crater."
+        )
+        self.guided_tracking_check.stateChanged.connect(
+            self._on_guided_tracking_changed
+        )
+        layout.addWidget(self.guided_tracking_check)
+
+        hint = QLabel(
+            "Scrub to a clear frame, choose Draw line, then click from the left rim "
+            "through the crater floor to the right rim. Add keyframes where the line changes."
+        )
+        hint.setObjectName("guideHint")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.draw_guide_btn = QPushButton("Draw line on this frame")
+        self.draw_guide_btn.setObjectName("guideButton")
+        self.draw_guide_btn.setCheckable(True)
+        self.draw_guide_btn.toggled.connect(self._on_guide_draw_toggled)
+        layout.addWidget(self.draw_guide_btn)
+
+        edit_row = QHBoxLayout()
+        self.undo_guide_btn = QPushButton("Undo point")
+        self.undo_guide_btn.clicked.connect(self._undo_guide_point)
+        edit_row.addWidget(self.undo_guide_btn)
+        self.save_guide_btn = QPushButton("Save keyframe")
+        self.save_guide_btn.clicked.connect(self._save_guide_keyframe)
+        edit_row.addWidget(self.save_guide_btn)
+        layout.addLayout(edit_row)
+
+        clear_row = QHBoxLayout()
+        clear_current_btn = QPushButton("Clear frame")
+        clear_current_btn.clicked.connect(self._clear_current_guide)
+        clear_row.addWidget(clear_current_btn)
+        clear_all_btn = QPushButton("Clear all")
+        clear_all_btn.clicked.connect(self._clear_all_guides)
+        clear_row.addWidget(clear_all_btn)
+        layout.addLayout(clear_row)
+
+        self.snap_guide_check = QCheckBox("Track nearby edge (14 px limit)")
+        self.snap_guide_check.setChecked(True)
+        self.snap_guide_check.setToolTip(
+            "Refine each interpolated point using only image evidence within 14 pixels of the guide."
+        )
+        self.snap_guide_check.stateChanged.connect(self._render_current)
+        layout.addWidget(self.snap_guide_check)
+
+        self.guide_keyframe_list = QListWidget()
+        self.guide_keyframe_list.setMaximumHeight(96)
+        self.guide_keyframe_list.itemClicked.connect(self._jump_to_guide_keyframe)
+        layout.addWidget(self.guide_keyframe_list)
+        self.guide_status_label = QLabel("No guide keyframes")
+        self.guide_status_label.setObjectName("guideHint")
+        layout.addWidget(self.guide_status_label)
+        return group
+
     def _build_analysis_controls(self) -> QGroupBox:
         group = QGroupBox("Detection")
         form = QFormLayout(group)
         form.setRowWrapPolicy(QFormLayout.DontWrapRows)
 
-        self.auto_surface_check = QCheckBox("Automatic surface tracking")
+        self.auto_surface_check = QCheckBox("Legacy automatic surface tracking")
         self.auto_surface_check.setChecked(self.analysis_settings.auto_surface)
+        self.auto_surface_check.setEnabled(not self.guided_tracking_check.isChecked())
         self.auto_surface_check.setToolTip(
             "Automatically trace the material/air boundary and infer crater rims, "
             "baseline, depth, width, and area."
@@ -598,6 +680,9 @@ class CraterDashboardWindow(QMainWindow):
             self.video_name_label.setText(Path(path).name)
             self.stabilized_frame_index = None
             self.stabilized_frame = None
+            self.guide_keyframes.clear()
+            self.guide_drafts.clear()
+            self._refresh_guide_keyframes()
             self.analysis_note_label.setText(
                 "Single-frame preview. Select Analyze run for event-aware review."
             )
@@ -651,6 +736,129 @@ class CraterDashboardWindow(QMainWindow):
                 f"Frame {value:,}  ·  {seconds:.2f} s"
             )
         self._render_current()
+
+    def _on_guide_draw_toggled(self, active: bool) -> None:
+        self.video_label.setCursor(Qt.CrossCursor if active else Qt.ArrowCursor)
+        self.draw_guide_btn.setText(
+            "Click crater points…" if active else "Draw line on this frame"
+        )
+        if active:
+            self.timer.stop()
+            self.play_btn.setText("Play")
+            self.guide_status_label.setText(
+                f"Drawing frame {self.current_frame_index:,} · click left to right"
+            )
+        else:
+            self._refresh_guide_keyframes()
+
+    def _on_guided_tracking_changed(self, *_args) -> None:
+        guided = self.guided_tracking_check.isChecked()
+        if hasattr(self, "auto_surface_check"):
+            self.auto_surface_check.setEnabled(not guided)
+        if not guided and self.draw_guide_btn.isChecked():
+            self.draw_guide_btn.setChecked(False)
+        self._render_current()
+
+    def _add_guide_point_from_view(self, widget_x: int, widget_y: int) -> None:
+        if not self.draw_guide_btn.isChecked() or self.video is None:
+            return
+        pixmap = self.video_label.pixmap()
+        if pixmap is None or pixmap.width() <= 0 or pixmap.height() <= 0:
+            return
+        image_width, image_height = self._composed_shape or (0, 0)
+        if image_width <= 0 or image_height <= 0:
+            return
+        offset_x = (self.video_label.width() - pixmap.width()) / 2.0
+        offset_y = (self.video_label.height() - pixmap.height()) / 2.0
+        local_x = widget_x - offset_x
+        local_y = widget_y - offset_y
+        if not (0 <= local_x < pixmap.width() and 0 <= local_y < pixmap.height()):
+            return
+        image_x = int(round(local_x * image_width / pixmap.width()))
+        image_y = int(round(local_y * image_height / pixmap.height()))
+        if image_y >= self._source_frame_height:
+            self.guide_status_label.setText("Draw on the video image, not the mask panel")
+            return
+        draft = self.guide_drafts.setdefault(self.current_frame_index, [])
+        if draft and image_x <= draft[-1][0]:
+            self.guide_status_label.setText("Points must move left to right · undo and try again")
+            return
+        draft.append((image_x, image_y))
+        self.guide_status_label.setText(
+            f"Frame {self.current_frame_index:,} · {len(draft)} point(s) · endpoints become rims"
+        )
+        self._render_current()
+
+    def _undo_guide_point(self) -> None:
+        draft = self.guide_drafts.get(self.current_frame_index)
+        if draft:
+            draft.pop()
+            if not draft:
+                self.guide_drafts.pop(self.current_frame_index, None)
+            self._render_current()
+        self.guide_status_label.setText(
+            f"Frame {self.current_frame_index:,} · {len(draft or [])} point(s)"
+        )
+
+    def _save_guide_keyframe(self) -> None:
+        draft = self.guide_drafts.get(self.current_frame_index, [])
+        if len(draft) < 3:
+            QMessageBox.warning(
+                self,
+                "Guide Keyframe",
+                "Add at least three points: left rim, crater floor, and right rim.",
+            )
+            return
+        self.guide_keyframes[self.current_frame_index] = list(draft)
+        self.guide_drafts.pop(self.current_frame_index, None)
+        self.draw_guide_btn.setChecked(False)
+        self._refresh_guide_keyframes()
+        self._render_current()
+
+    def _clear_current_guide(self) -> None:
+        self.guide_drafts.pop(self.current_frame_index, None)
+        self.guide_keyframes.pop(self.current_frame_index, None)
+        self._refresh_guide_keyframes()
+        self._render_current()
+
+    def _clear_all_guides(self) -> None:
+        if not self.guide_keyframes and not self.guide_drafts:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Clear Guides",
+            "Remove every crater-line keyframe from this run?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.guide_keyframes.clear()
+        self.guide_drafts.clear()
+        self._refresh_guide_keyframes()
+        self._render_current()
+
+    def _refresh_guide_keyframes(self) -> None:
+        if not hasattr(self, "guide_keyframe_list"):
+            return
+        self.guide_keyframe_list.clear()
+        for frame_index in sorted(self.guide_keyframes):
+            points = self.guide_keyframes[frame_index]
+            item = QListWidgetItem(f"Frame {frame_index:,} · {len(points)} points")
+            item.setData(Qt.UserRole, frame_index)
+            self.guide_keyframe_list.addItem(item)
+        count = len(self.guide_keyframes)
+        self.guide_status_label.setText(
+            f"{count} guide keyframe{'s' if count != 1 else ''}"
+            if count
+            else "No guide keyframes"
+        )
+
+    def _jump_to_guide_keyframe(self, item: QListWidgetItem) -> None:
+        frame_index = item.data(Qt.UserRole)
+        if frame_index is None or self.video is None:
+            return
+        self.frame_slider.setValue(int(frame_index))
 
     def _sync_settings(self) -> None:
         tilt = (self.tilt_slider.value() - 28) * 0.25
@@ -723,8 +931,40 @@ class CraterDashboardWindow(QMainWindow):
                 self._render_current()
             return
         settings = self.analysis_settings.normalized(frame.shape[0])
-        self.current_result = self.engine.analyze_frame(frame, settings)
+        self._source_frame_height = frame.shape[0]
+        draft = self.guide_drafts.get(self.current_frame_index, [])
+        if self.guided_tracking_check.isChecked():
+            if len(draft) >= 2:
+                guide_points = list(draft)
+                is_keyframe = True
+            else:
+                guide_points, _, is_keyframe = interpolate_guides(
+                    self.guide_keyframes,
+                    self.current_frame_index,
+                    settings.x_step,
+                )
+            if guide_points:
+                self.current_result = self.engine.analyze_guided_frame(
+                    frame,
+                    settings,
+                    guide_points,
+                    is_keyframe=is_keyframe,
+                    snap_to_edge=self.snap_guide_check.isChecked(),
+                )
+            else:
+                self.current_result = AnalysisResult(
+                    frame=frame,
+                    solid_mask=np.zeros(frame.shape[:2], dtype=np.uint8),
+                    profile_points=[],
+                    metrics=compute_metrics([], settings.surface_boundary),
+                    geometry=None,
+                    detection_mode="guided",
+                    status="No crater line defined",
+                )
+        else:
+            self.current_result = self.engine.analyze_frame(frame, settings)
         composed = self._compose_result(self.current_result, settings)
+        self._composed_shape = (composed.shape[1], composed.shape[0])
         self.video_label.setPixmap(
             frame_to_pixmap(composed).scaled(
                 self.video_label.size(),
@@ -817,6 +1057,25 @@ class CraterDashboardWindow(QMainWindow):
                     cv2.circle(panel, result.geometry.right_rim, 7, (255, 80, 80), -1)
                     cv2.circle(panel, result.geometry.center, 7, (0, 80, 255), -1)
 
+        authored_points = self.guide_drafts.get(
+            self.current_frame_index,
+            self.guide_keyframes.get(self.current_frame_index, []),
+        )
+        if self.guided_tracking_check.isChecked() and authored_points:
+            raw = np.asarray(authored_points, dtype=np.int32).reshape((-1, 1, 2))
+            if len(authored_points) > 1:
+                cv2.polylines(
+                    current_frame,
+                    [raw],
+                    isClosed=False,
+                    color=(210, 80, 235),
+                    thickness=2,
+                )
+            for point_number, point in enumerate(authored_points):
+                cv2.circle(current_frame, point, 6, (210, 80, 235), -1)
+                if point_number in (0, len(authored_points) - 1):
+                    cv2.circle(current_frame, point, 9, (245, 210, 255), 2)
+
         cv2.putText(
             current_frame,
             f"Frame {self.current_frame_index}",
@@ -842,6 +1101,15 @@ class CraterDashboardWindow(QMainWindow):
 
     def _update_metrics(self, result: AnalysisResult) -> None:
         m = result.metrics
+        if result.detection_mode == "guided" and result.geometry is None:
+            self.metrics_label.setText(
+                "No crater measurement\n\n"
+                "Draw the true crater line on a representative frame. "
+                "The first and last points define the rims."
+            )
+            self.star_btn.setEnabled(False)
+            self.star_btn.setToolTip("Define and review a guided crater line first.")
+            return
         frame_width = max(1, result.frame.shape[1])
         mm_per_px = self.analysis_settings.real_width_mm / frame_width
         width_mm = m.max_crater_width_px * mm_per_px
@@ -855,17 +1123,26 @@ class CraterDashboardWindow(QMainWindow):
                     f"Maximum depth: {depth_mm:.2f} mm  ({m.max_crater_depth_px:.1f} px)",
                     f"Cross-section area: {area_mm2:.2f} mm²  ({m.crater_area_px:.1f} px²)",
                     f"Baseline tilt: {m.baseline_tilt_degrees:+.2f}°",
-                    f"Confidence: {m.confidence:.0%}",
                     (
-                        f"Surface visibility: {result.geometry.profile_confidence:.0%}"
-                        if result.geometry is not None
-                        else "Surface visibility: unavailable"
+                        f"Tracking confidence: {m.confidence:.0%}"
+                        if result.detection_mode == "guided"
+                        else f"Confidence: {m.confidence:.0%}"
+                    ),
+                    (
+                        f"Local edge support: {result.geometry.profile_confidence:.0%}"
+                        if result.detection_mode == "guided" and result.geometry is not None
+                        else (
+                            f"Surface visibility: {result.geometry.profile_confidence:.0%}"
+                            if result.geometry is not None
+                            else "Surface visibility: unavailable"
+                        )
                     ),
                 ]
             )
         )
         self.star_btn.setEnabled(
             result.detection_mode == "manual"
+            or (result.detection_mode == "guided" and result.geometry is not None)
             or (
                 result.geometry is not None
                 and result.metrics.confidence >= 0.42
@@ -1154,7 +1431,11 @@ class CraterDashboardWindow(QMainWindow):
         self.stabilized_frame = self._build_temporally_stabilized_frame(best_index)
         self.analysis_note_label.setText(
             f"Event-aware selection near frame {event_frame:,}. "
-            "Review uses a 7-frame temporal median to suppress moving dust and glare."
+            + (
+                "Draw the verified crater line here, then add keyframes where it changes."
+                if self.guided_tracking_check.isChecked()
+                else "Review uses a 7-frame temporal median to suppress moving dust and glare."
+            )
         )
         self.frame_slider.setValue(best_index)
         if self.current_frame_index == best_index:
@@ -1290,11 +1571,19 @@ class CraterDashboardWindow(QMainWindow):
                     "confidence": entry.confidence,
                 }
             )
-        return {"video_path": self.current_video_path, "starred_frames": entries}
+        guide_keyframes = {
+            str(frame_index): [[x, y] for x, y in points]
+            for frame_index, points in sorted(self.guide_keyframes.items())
+        }
+        return {
+            "video_path": self.current_video_path,
+            "starred_frames": entries,
+            "guide_keyframes": guide_keyframes,
+        }
 
     def _save_session_to_library(self) -> None:
-        if not self.starred_frames:
-            QMessageBox.warning(self, "Save Session", "No starred frames to save.")
+        if not self.starred_frames and not self.guide_keyframes:
+            QMessageBox.warning(self, "Save Session", "No measurements or guide keyframes to save.")
             return
         suggested = f"session_frame_{self.current_frame_index}"
         name, ok = QInputDialog.getText(self, "Save Session", "Session name:", text=suggested)
@@ -1313,7 +1602,8 @@ class CraterDashboardWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Session Saved",
-            f"Saved {len(self.starred_frames)} starred frame(s) to session library.",
+            f"Saved {len(self.starred_frames)} measurement(s) and "
+            f"{len(self.guide_keyframes)} guide keyframe(s).",
         )
 
     def _save_selected_session(self) -> None:
@@ -1321,8 +1611,8 @@ class CraterDashboardWindow(QMainWindow):
         if not filename:
             QMessageBox.warning(self, "Save Session", "No session selected.")
             return
-        if not self.starred_frames:
-            QMessageBox.warning(self, "Save Session", "No starred frames to save.")
+        if not self.starred_frames and not self.guide_keyframes:
+            QMessageBox.warning(self, "Save Session", "No measurements or guide keyframes to save.")
             return
         save_session(str(self.session_dir / filename), self._build_starred_session_payload())
         QMessageBox.information(self, "Session Saved", f"Updated session '{filename}'.")
@@ -1342,8 +1632,9 @@ class CraterDashboardWindow(QMainWindow):
             return
 
         entries = data.get("starred_frames", [])
-        if not entries:
-            QMessageBox.warning(self, "Load Session", "Session file contains no starred frames.")
+        saved_guides = data.get("guide_keyframes", {})
+        if not entries and not saved_guides:
+            QMessageBox.warning(self, "Load Session", "Session file contains no measurements or guides.")
             return
 
         self.starred_frames.clear()
@@ -1367,7 +1658,14 @@ class CraterDashboardWindow(QMainWindow):
                 baseline_points=baseline_points or None,
                 confidence=float(item.get("confidence", 0.0)),
             )
+        self.guide_keyframes = {
+            int(frame_index): [(int(point[0]), int(point[1])) for point in points]
+            for frame_index, points in saved_guides.items()
+            if isinstance(points, list) and len(points) >= 2
+        }
+        self.guide_drafts.clear()
         self._refresh_starred_list()
+        self._refresh_guide_keyframes()
 
         saved_video_path = data.get("video_path")
         if self.video is None and saved_video_path and Path(saved_video_path).exists():
@@ -1384,7 +1682,8 @@ class CraterDashboardWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Session Loaded",
-            f"Loaded {len(self.starred_frames)} starred frame(s).",
+            f"Loaded {len(self.starred_frames)} measurement(s) and "
+            f"{len(self.guide_keyframes)} guide keyframe(s).",
         )
 
     def _rename_selected_session(self) -> None:
