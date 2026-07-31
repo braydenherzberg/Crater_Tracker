@@ -185,10 +185,10 @@ def test_sparse_operator_clicks_define_guided_crater_geometry():
 
     assert result.detection_mode == "guided"
     assert result.geometry is not None
-    assert result.geometry.left_rim[0] == 470
-    assert result.geometry.right_rim[0] == 780
-    assert 55.0 <= result.metrics.max_crater_depth_px <= 75.0
-    assert result.metrics.max_crater_width_px == 310.0
+    assert 470 <= result.geometry.left_rim[0] <= 535
+    assert 720 <= result.geometry.right_rim[0] <= 780
+    assert 50.0 <= result.metrics.max_crater_depth_px <= 75.0
+    assert 220.0 <= result.metrics.max_crater_width_px <= 310.0
     assert result.status.startswith("Guided keyframe")
 
 
@@ -210,3 +210,39 @@ def test_guides_fill_click_gaps_and_interpolate_between_frames():
     assert dense[0] == (30, 100)
     assert dense[-1] == (70, 100)
     assert len(dense) == 21
+
+
+def test_user_labeled_mars3_internal_interface_finds_crater_shoulders():
+    # Approximate source-frame coordinates transcribed from the operator's red
+    # annotation on MarsPerfect Run 3, frame 9,191. The annotation includes
+    # flat supporting wings, so its endpoints must not become the crater rims.
+    labeled_interface = [
+        (217, 567),
+        (341, 567),
+        (466, 561),
+        (591, 562),
+        (716, 575),
+        (842, 596),
+        (966, 619),
+        (1091, 636),
+        (1216, 612),
+        (1340, 601),
+        (1465, 579),
+        (1591, 591),
+        (1716, 590),
+    ]
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    result = AnalysisEngine().analyze_guided_frame(
+        frame,
+        AnalysisSettings(auto_surface=True, x_step=3),
+        labeled_interface,
+        is_keyframe=True,
+        snap_to_edge=False,
+    )
+
+    assert result.geometry is not None
+    assert 520 <= result.geometry.left_rim[0] <= 760
+    assert 1340 <= result.geometry.right_rim[0] <= 1540
+    assert 1000 <= result.geometry.center[0] <= 1160
+    assert 600 <= result.metrics.max_crater_width_px <= 1000
+    assert 55 <= result.metrics.max_crater_depth_px <= 90

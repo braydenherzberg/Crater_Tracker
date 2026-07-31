@@ -313,8 +313,8 @@ class CraterDashboardWindow(QMainWindow):
         layout.addWidget(self.guided_tracking_check)
 
         hint = QLabel(
-            "Scrub to a clear frame, choose Draw line, then click from the left rim "
-            "through the crater floor to the right rim. Add keyframes where the line changes."
+            "Scrub to a clear frame, choose Draw line, then trace the subsurface "
+            "interface left-to-right with level material on both sides."
         )
         hint.setObjectName("guideHint")
         hint.setWordWrap(True)
@@ -785,7 +785,7 @@ class CraterDashboardWindow(QMainWindow):
             return
         draft.append((image_x, image_y))
         self.guide_status_label.setText(
-            f"Frame {self.current_frame_index:,} · {len(draft)} point(s) · endpoints become rims"
+            f"Frame {self.current_frame_index:,} · {len(draft)} point(s) · include both level wings"
         )
         self._render_current()
 
@@ -806,7 +806,8 @@ class CraterDashboardWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Guide Keyframe",
-                "Add at least three points: left rim, crater floor, and right rim.",
+                "Add at least three points along the subsurface boundary, including "
+                "level material before and after the crater.",
             )
             return
         self.guide_keyframes[self.current_frame_index] = list(draft)
@@ -1104,8 +1105,8 @@ class CraterDashboardWindow(QMainWindow):
         if result.detection_mode == "guided" and result.geometry is None:
             self.metrics_label.setText(
                 "No crater measurement\n\n"
-                "Draw the true crater line on a representative frame. "
-                "The first and last points define the rims."
+                "Draw the true subsurface crater interface on a representative frame, "
+                "including level material on both sides."
             )
             self.star_btn.setEnabled(False)
             self.star_btn.setToolTip("Define and review a guided crater line first.")
@@ -1124,7 +1125,11 @@ class CraterDashboardWindow(QMainWindow):
                     f"Cross-section area: {area_mm2:.2f} mm²  ({m.crater_area_px:.1f} px²)",
                     f"Baseline tilt: {m.baseline_tilt_degrees:+.2f}°",
                     (
-                        f"Tracking confidence: {m.confidence:.0%}"
+                        (
+                            "Guide source: operator keyframe"
+                            if "keyframe" in result.status.lower()
+                            else "Guide source: temporal interpolation"
+                        )
                         if result.detection_mode == "guided"
                         else f"Confidence: {m.confidence:.0%}"
                     ),

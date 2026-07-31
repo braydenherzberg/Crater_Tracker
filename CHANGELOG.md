@@ -7,7 +7,9 @@
 - Added conservative local edge tracking constrained to 14 pixels around the guide.
 - Made guided tracking the default and suppressed all crater metrics until an
   operator defines the intended physical interface.
-- Defined guided rim points from curve endpoints and the depth from their local baseline.
+- Defined guided rim points from the transitions away from the surrounding local level.
+- Updated guided geometry from operator ground truth so level supporting wings
+  locate the crater shoulders instead of being counted as crater width.
 - Persisted guide keyframes in saved analysis sessions.
 - Added regression tests for guided measurement and spatial/temporal interpolation.
 - Reclassified the old automatic surface detector as unverified for the supplied

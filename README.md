@@ -26,7 +26,7 @@ The guided workflow draws:
 
 - **Magenta:** the operator's clicked control points and line
 - **Green/orange:** the dense tracked crater curve
-- **Blue:** endpoint-to-endpoint baseline and rim markers
+- **Blue:** inferred shoulder-to-shoulder baseline and rim markers
 - **Red:** deepest detected point
 
 ## Run from source
@@ -47,8 +47,10 @@ python run_desktop.py
 3. Leave **Use guided tracking** enabled.
 4. Select **Analyze run** to locate the experiment event and review a stable
    post-event frame.
-5. Select **Draw line on this frame** and click left-to-right from the true left
-   rim, through the crater floor, to the true right rim. Save the keyframe.
+5. Select **Draw line on this frame** and click left-to-right along the true
+   subsurface crater interface. Include a short level section on both sides so
+   the software can locate where the crater leaves and returns to that baseline.
+   Save the keyframe.
 6. Scrub through the run. Add another keyframe wherever the interpolated line
    stops following the same physical interface.
 7. Inspect the tracked curve and baseline, then accept frames for export.

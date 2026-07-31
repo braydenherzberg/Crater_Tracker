@@ -14,8 +14,8 @@ measurement until the operator identifies the intended physical interface.
 ## Guided measurement model
 
 1. Scrub to a frame where the crater boundary can be identified.
-2. Click points left-to-right, beginning at the true left rim, following the
-   crater floor, and ending at the true right rim.
+2. Click points left-to-right along the physical subsurface interface, including
+   a short level supporting section before and after the crater.
 3. Save the line as a guide keyframe.
 4. Add keyframes later in the video whenever the interpolated line no longer
    follows the same interface.
@@ -31,14 +31,15 @@ vertical image-gradient evidence. Refinement is limited to 14 pixels around the
 guide and carries a strong distance penalty. This local step may improve fit in
 low contrast, but it cannot legitimately identify a different interface.
 
-The first and last curve points are the operator-defined rims. The baseline is
-the straight line connecting them. Pixel coordinates increase downward, so
-depth is the positive vertical distance below that baseline. Measurements are:
+The outer portions of the curve estimate the undisturbed local level. The rims
+are where the curve leaves and returns to that level; the first and last clicks
+are not assumed to be rims. Pixel coordinates increase downward, so depth is
+the positive vertical distance below the inferred rim baseline. Measurements are:
 
-- **Rim-to-rim width:** horizontal distance between the two endpoint rims
-- **Maximum depth:** largest vertical distance below the endpoint baseline
+- **Rim-to-rim width:** horizontal distance between inferred shoulder transitions
+- **Maximum depth:** largest vertical distance below the local rim baseline
 - **Cross-section area:** numerical integral of positive depth along the profile
-- **Baseline tilt:** angle of the endpoint baseline in image coordinates
+- **Baseline tilt:** angle of the local rim baseline in image coordinates
 - **Local edge support:** strength of nearby image-gradient evidence, not proof
   that the selected interface is physically correct
 

@@ -122,7 +122,12 @@ def snap_guide_to_local_edge(
 def geometry_from_guide(
     points: List[Point], evidence_confidence: float, is_keyframe: bool
 ) -> CraterGeometry | None:
-    """Measure the user-defined crater line against its endpoint baseline."""
+    """Infer crater shoulders within a user-defined physical interface.
+
+    Operators are encouraged to include level material on both sides of the
+    crater. Those supporting wings define the undisturbed local baseline; the
+    first and last clicks are therefore not automatically treated as rims.
+    """
 
     if len(points) < 3:
         return None
@@ -131,20 +136,66 @@ def geometry_from_guide(
     ys = np.asarray([p[1] for p in ordered], dtype=np.float64)
     if xs[-1] - xs[0] < 2:
         return None
-    baseline = np.interp(xs, [xs[0], xs[-1]], [ys[0], ys[-1]])
-    depths = np.maximum(ys - baseline, 0.0)
-    center_index = int(np.argmax(depths))
+    smooth_window = min(21, len(ys) if len(ys) % 2 == 1 else len(ys) - 1)
+    smooth_y = (
+        cv2.GaussianBlur(ys.astype(np.float32).reshape(1, -1), (smooth_window, 1), 0).ravel()
+        if smooth_window >= 3
+        else ys.copy()
+    )
+
+    # Fit the undisturbed level from both outer wings. This remains compatible
+    # with rim-to-rim annotations, while allowing a full boundary trace whose
+    # endpoints lie well outside the physical crater.
+    wing_count = max(3, min(len(xs) // 3, int(round(len(xs) * 0.16))))
+    wing_indices = np.r_[0:wing_count, len(xs) - wing_count : len(xs)]
+    slope, intercept = np.polyfit(xs[wing_indices], smooth_y[wing_indices], 1)
+    wing_baseline = slope * xs + intercept
+    residual = smooth_y - wing_baseline
+    peak_index = int(np.argmax(residual))
+    peak_depth = float(residual[peak_index])
+    if peak_depth < 2.0:
+        return None
+
+    rim_threshold = max(2.0, peak_depth * 0.08)
+    left = peak_index
+    right = peak_index
+    while left > 0 and residual[left] > rim_threshold:
+        left -= 1
+    while right < len(xs) - 1 and residual[right] > rim_threshold:
+        right += 1
+
+    # Choose the closest return to the wing baseline around each threshold
+    # crossing. This suppresses small hand-drawn wiggles on the flat shoulders.
+    rim_window = max(2, int(len(xs) * 0.035))
+    left_lo, left_hi = max(0, left - rim_window), min(peak_index, left + rim_window)
+    right_lo, right_hi = max(peak_index, right - rim_window), min(len(xs) - 1, right + rim_window)
+    left = left_lo + int(np.argmin(np.abs(residual[left_lo : left_hi + 1])))
+    right = right_lo + int(np.argmin(np.abs(residual[right_lo : right_hi + 1])))
+    if right - left < 3:
+        return None
+
+    crater_xs = xs[left : right + 1]
+    crater_ys = smooth_y[left : right + 1]
+    baseline = np.interp(
+        crater_xs,
+        [crater_xs[0], crater_xs[-1]],
+        [wing_baseline[left], wing_baseline[right]],
+    )
+    depths = np.maximum(crater_ys - baseline, 0.0)
+    center_local = int(np.argmax(depths))
     baseline_points = [
-        (int(round(x)), int(round(y))) for x, y in zip(xs, baseline)
+        (int(round(x)), int(round(y))) for x, y in zip(crater_xs, baseline)
     ]
-    crater_points = [(int(round(x)), int(round(y))) for x, y in zip(xs, ys)]
+    crater_points = [
+        (int(round(x)), int(round(y))) for x, y in zip(crater_xs, crater_ys)
+    ]
     annotation_confidence = 1.0 if is_keyframe else 0.78
     confidence = float(
         np.clip(0.75 * annotation_confidence + 0.25 * evidence_confidence, 0.0, 1.0)
     )
     return CraterGeometry(
         left_rim=crater_points[0],
-        center=crater_points[center_index],
+        center=crater_points[center_local],
         right_rim=crater_points[-1],
         baseline_points=baseline_points,
         crater_points=crater_points,
