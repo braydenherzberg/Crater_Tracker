@@ -66,7 +66,7 @@ from crater_app.desktop.timeline import Timeline
 Point = Tuple[float, float]
 WEAK_EDGE = 0.30
 DEFAULT_FRAME_WIDTH_MM = 124.0
-DOCS_URL = "https://github.com/braydenherzberg/crater_tracker/blob/main/docs/analysis_method.md"
+DOCS_URL = "https://github.com/braydenherzberg/Crater_Tracker/blob/main/docs/analysis_method.md"
 
 
 class Worker(QThread):

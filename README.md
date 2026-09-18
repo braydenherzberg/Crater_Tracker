@@ -10,7 +10,7 @@ Everything runs offline. Videos never leave your computer.
 ## Download
 
 Get the latest build from the
-[Releases page](https://github.com/braydenherzberg/crater_tracker/releases/latest):
+[Releases page](https://github.com/braydenherzberg/Crater_Tracker/releases/latest):
 
 | System | File |
 | --- | --- |
