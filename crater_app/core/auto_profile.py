@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 import cv2
@@ -22,6 +22,7 @@ class CraterGeometry:
     profile_confidence: float
     geometry_confidence: float
     status: str
+    notes: List[str] = field(default_factory=list)
 
 
 @dataclass

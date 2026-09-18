@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.5.0
+
+Rebuilt desktop app around operator-guided tracing.
+
+- New dark, single-accent interface: tool rail, video canvas, section view,
+  two-level timeline and a focused inspector; legacy detection, threshold
+  controls, presets and the mask panel are gone from the UI.
+- Point editing on the canvas: click adds, drag moves, right-click deletes,
+  a 5× loupe follows the cursor, wheel zoom and Alt-drag pan.
+- Editing an interpolated frame starts from the interpolated line; **S** keeps
+  an interpolated line as a keyframe. Full undo/redo.
+- Background tracking pass after every edit marks weak frames on the timeline
+  (N jumps to the next) and plots width through time.
+- **Find event** scans the run and marks the strongest sustained burst of
+  activity, then jumps to where the scene settles.
+- Edge snap is now a dynamic-programming path search with polarity detection,
+  anisotropic blur, sub-pixel rows and 1 px sampling. Across simulated
+  operators it cuts width spread from 50.8 px to 8.9 px on Mars Perfect Run 3.
+- Edge support now measures brightness contrast across the line; confidence
+  decays with distance from the nearest keyframe.
+- Warnings when the line does not reach flat ground or its ends are not level.
+- Two-point scale calibration (K), stored in the session.
+- Time-series export: one calibrated row per sampled frame between keyframes,
+  optional profile points, and a provenance JSON. `cli_batch` now exports from
+  a session.
+- Sessions v2 (calibration, event scan) keep unknown keys from older sessions;
+  opening a video reopens its latest session. Unsaved-changes prompt.
+- Much faster scrubbing on HEVC footage: forward reads instead of seeks and
+  backward block prefetch (backward step ~7 ms instead of ~150 ms).
+- Tracking benchmark (`cli_benchmark`) scoring against `gt_*` sessions.
+- Packaging: app icon, PyInstaller spec, macOS DMG (Apple silicon and Intel),
+  Windows installer and zip, smoke-tested in CI and published on tagged
+  releases.
+
 ## 0.4.0
 
 - Added on-canvas crater-line annotation with left-to-right control points.

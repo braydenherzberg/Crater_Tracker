@@ -1,104 +1,119 @@
-# Crater Side-Profile Analyzer
+# Crater
 
-An offline desktop application for tracing and measuring crater cross-sections
-from side-camera experiment videos.
+Operator-guided crater tracing for side-camera impact videos. You draw the
+crater line on a few frames; Crater snaps it to the image edge with sub-pixel
+precision, tracks it between your keyframes, shows you where tracking is weak,
+and exports calibrated width, depth and area for every frame.
 
-The analyzer is designed for bright-background/dark-material footage captured
-through a transparent test container. It runs locally: videos and measurements
-do not leave the computer.
+Everything runs offline. Videos never leave your computer.
 
-## Current capabilities
+## Download
 
-- Operator-guided crater-line keyframes on the video canvas
-- Spatial interpolation between sparse clicks and temporal interpolation between keyframes
-- Conservative local edge refinement that cannot leave the user-defined search corridor
-- Explicit no-measurement state until the physical crater interface is defined
-- Rim-to-rim width, maximum depth, cross-section area, baseline tilt, and confidence
-- Event-aware sampling of long recordings with post-event candidate selection
-- Seven-frame temporal median review for low-visibility dust and glare
-- Source-video FPS detection and calibrated millimeter exports
-- Manual threshold/scan mode as a fallback for difficult footage
-- Frame playback, scrubbing, overlays, bookmarks, presets, and saved sessions
-- Snapshot, profile CSV, metrics CSV, and headless batch export
-- macOS and Windows packaging scripts
+Get the latest build from the
+[Releases page](https://github.com/braydenherzberg/crater_tracker/releases/latest):
 
-The guided workflow draws:
+| System | File |
+| --- | --- |
+| Mac with Apple silicon (M1 or newer) | `Crater-macOS-AppleSilicon.dmg` |
+| Intel Mac | `Crater-macOS-Intel.dmg` |
+| Windows 10 / 11 | `Crater-Windows-Setup.exe` (or the portable `Crater-Windows.zip`) |
 
-- **Magenta:** the operator's clicked control points and line
-- **Green/orange:** the dense tracked crater curve
-- **Blue:** inferred shoulder-to-shoulder baseline and rim markers
-- **Red:** deepest detected point
+**macOS:** open the DMG and drag Crater into Applications. The first launch is
+blocked because the app is not yet notarized: open **System Settings → Privacy
+& Security** and click **Open Anyway**.
+**Windows:** if SmartScreen appears, click **More info → Run anyway**.
+
+## Workflow
+
+1. **Open a video** (⌘O / Ctrl+O). A saved session for the same video opens
+   with it automatically.
+2. **Find event.** Crater scans the whole run (about 15 s for a 10,000-frame
+   video), marks the experiment on the timeline and jumps to where the scene
+   settles.
+3. **Set the scale.** Enter the real width of the full frame, or press **K** and
+   click two points a known distance apart (more accurate: measure in the
+   crater's plane).
+4. **Trace a keyframe.** Press **D** and click along the crater interface from
+   flat ground on the left to flat ground on the right. A 5× loupe follows the
+   cursor. Drag a point to move it, right-click to delete it.
+5. **Add keyframes where needed.** Step through the run (←/→, ⇧←/→). On any
+   frame, **D** starts from the interpolated line, so you only nudge a few
+   points; **S** keeps an interpolated line that is already right. After every
+   edit Crater tracks the whole keyframe range in the background and marks
+   weak frames in amber on the timeline: press **N** to jump to the next one.
+6. **Export** (⌘E / Ctrl+E) a CSV with one row per sampled frame, plus an
+   optional profile-point CSV and a JSON file recording how the numbers were
+   made.
+
+Save with ⌘S / Ctrl+S. Sessions live in `~/.crater_analysis/sessions/`.
+
+## What you see
+
+- **Amber points and line:** your clicks. Solid on keyframes, dashed on an
+  unsaved line, dotted where the line is interpolated.
+- **White line:** the tracked interface after edge snapping.
+- **Dashed white line and ticks:** the rim-to-rim baseline and the rims.
+- **Section view** (under the video): the tracked profile with the depth axis
+  stretched so millimetre-scale craters are visible, with dimension lines.
+- **Timeline:** the whole run on top and a zoomable window below (scroll to
+  zoom), with scene activity, the event, keyframes, per-frame edge support
+  (amber = weak) and the width through time.
+
+## Keys
+
+| Key | Action | Key | Action |
+| --- | --- | --- | --- |
+| D | Edit line on this frame | ← / → | Previous / next frame |
+| S | Keep line as keyframe | ⇧← / ⇧→ | Back / forward 24 frames |
+| X | Clear this frame | [ / ] | Previous / next keyframe |
+| ⌘Z / ⌫ | Undo (⇧⌘Z redo) | N | Next weak frame |
+| E | Snap to edge on/off | Space | Play / pause |
+| C | Enhance contrast (display only) | Wheel | Zoom video · Alt-drag pans · F fits |
+| T | 7-frame temporal median (removes moving dust) | K | Measure scale |
+| P | Save frame with overlays as PNG | Esc | Stop editing |
+
+## Measurements
+
+Each exported row has `frame, time_s, source, frames_to_key, width_mm,
+depth_mm, area_mm2, baseline_tilt_deg, left_rim_x_mm, right_rim_x_mm,
+deepest_x_mm, edge_support, confidence, notes`.
+
+- `source` is `keyframe` (your line) or `interpolated` / `held` (derived).
+- `edge_support` is the share of the line with a clear brightness change
+  across it. Below 30% the image barely shows the interface.
+- `confidence` combines distance from the nearest keyframe with edge support.
+  It is a quality indicator, not an uncertainty interval.
+
+The method, its limits and validation advice are in
+[`docs/analysis_method.md`](docs/analysis_method.md).
+
+## Command line
+
+```bash
+# Export a time series from a saved session
+python -m crater_app.cli_batch --session ~/.crater_analysis/sessions/gt_MP_Run3.json \
+  --out mp3_series.csv --frame-step 10 --profiles
+
+# Score tracking against hand-labelled gt_* sessions (see docs/benchmark.md)
+python -m crater_app.cli_benchmark run
+```
 
 ## Run from source
 
-Python 3.10 or newer is required.
+Python 3.10 or newer:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 python -m pip install -e ".[dev]"
-python run_desktop.py
-```
-
-## Recommended workflow
-
-1. Open a side-camera video.
-2. Enter the real width represented by the **full video frame**.
-3. Leave **Use guided tracking** enabled.
-4. Select **Analyze run** to locate the experiment event and review a stable
-   post-event frame.
-5. Select **Draw line on this frame** and click left-to-right along the true
-   subsurface crater interface. Include a short level section on both sides so
-   the software can locate where the crater leaves and returns to that baseline.
-   Save the keyframe.
-6. Scrub through the run. Add another keyframe wherever the interpolated line
-   stops following the same physical interface.
-7. Inspect the tracked curve and baseline, then accept frames for export.
-
-Confidence is a quality heuristic, not a scientific uncertainty interval.
-Measurements should not be accepted unless the overlay follows the physical
-surface and the inferred rim-to-rim baseline is plausible.
-
-The legacy automatic surface detector remains available when guided tracking is
-disabled, but it is not a verified crater detector for the supplied low-visibility
-runs. It can select a visually strong material/air boundary that is not the
-intended physical crater. Do not treat its measurements as validated ground truth.
-
-## Batch analysis
-
-```bash
-python -m crater_app.cli_batch \
-  --video "/path/to/run.mp4" \
-  --out "metrics.csv" \
-  --frame-step 24
-```
-
-`--frame-step` is useful for high-speed footage. At 240 FPS, a step of 24
-produces roughly ten measurement rows per second.
-
-An optional JSON settings file may be supplied with `--settings-json`.
-
-## Testing
-
-```bash
+python run_desktop.py [video.mp4]
 pytest -q
 ```
 
-The regression suite includes deterministic manual analysis, synthetic automatic
-surface recovery, guided geometry, and interpolation between guide keyframes.
+## Building and releasing
 
-## Packaging
-
-Local packaging instructions and release caveats are in
-[`docs/release.md`](docs/release.md). GitHub Actions can build downloadable
-macOS and Windows archives, but public frictionless distribution requires:
-
-- Apple Developer ID signing and notarization for macOS
-- Authenticode code signing for Windows
-- A project license selected by the repository owner
-- Clean-machine installation tests
-
-## Analysis notes
-
-The automatic method and its limitations are documented in
-[`docs/analysis_method.md`](docs/analysis_method.md).
+`scripts/package_macos.sh` and `scripts/package_windows.ps1` build locally with
+the same recipe as CI (`packaging/crater.spec`). Pushing a tag such as `v0.5.0`
+makes GitHub Actions test the code, build and smoke-test the Mac and Windows
+apps, and publish them on the Releases page. See
+[`docs/release.md`](docs/release.md).

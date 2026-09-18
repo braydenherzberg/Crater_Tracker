@@ -78,19 +78,24 @@ class AnalysisEngine:
         *,
         is_keyframe: bool,
         snap_to_edge: bool = True,
+        annotation_confidence: float | None = None,
     ) -> AnalysisResult:
         """Analyze only the crater interface supplied by the operator."""
 
         normalized = settings.normalized(frame.shape[0])
         rotated = rotate_frame(frame, normalized.tilt_degrees)
-        dense_guide = densify_guide(guide_points, normalized.x_step)
+        # One column per pixel: the rims and depth are then not quantised to
+        # the coarser x_step used by the legacy detectors.
+        dense_guide = densify_guide(guide_points, 1)
         if snap_to_edge:
             profile, evidence = snap_guide_to_local_edge(
                 rotated, dense_guide, normalized
             )
         else:
             profile, evidence = dense_guide, 0.0
-        geometry = geometry_from_guide(profile, evidence, is_keyframe)
+        geometry = geometry_from_guide(
+            profile, evidence, is_keyframe, annotation_confidence
+        )
         if geometry is None:
             metrics = compute_metrics([], normalized.surface_boundary)
             mask = np.zeros(rotated.shape[:2], dtype=np.uint8)
@@ -102,12 +107,6 @@ class AnalysisEngine:
                 geometry.geometry_confidence,
             )
             mask = np.zeros(rotated.shape[:2], dtype=np.uint8)
-            polygon = [
-                (geometry.crater_points[0][0], rotated.shape[0] - 1),
-                *geometry.crater_points,
-                (geometry.crater_points[-1][0], rotated.shape[0] - 1),
-            ]
-            cv2.fillPoly(mask, [np.asarray(polygon, dtype=np.int32)], 255)
             status = geometry.status
         return AnalysisResult(
             frame=rotated,

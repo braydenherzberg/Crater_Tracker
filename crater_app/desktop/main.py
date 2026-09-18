@@ -1,1911 +1,1420 @@
+"""Crater side-profile analyzer: desktop application."""
+
 from __future__ import annotations
 
 import copy
+import csv
+import json
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QSettings, Qt, QTimer, Signal
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtCore import QEvent, QSettings, Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QIcon, QKeySequence
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QCheckBox,
-    QComboBox,
     QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
     QFrame,
-    QGroupBox,
+    QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
-    QPushButton,
     QProgressDialog,
-    QScrollArea,
-    QSizePolicy,
-    QSlider,
+    QPushButton,
+    QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
 
-from crater_app.core.analysis import AnalysisEngine, AnalysisResult
-from crater_app.core.guided_profile import interpolate_guides
-from crater_app.core.metrics import compute_geometry_metrics, compute_metrics
-from crater_app.core.settings import AnalysisSettings
-from crater_app.core.video_reader import VideoReader
-from crater_app.desktop.exporter import export_metrics_csv, export_profile_csv, export_snapshot
-from crater_app.desktop.presets import (
-    default_preset_dir,
-    delete_named_preset,
-    list_presets,
-    load_preset,
-    rename_named_preset,
-    save_named_preset,
-    save_preset,
-)
-from crater_app.desktop.sessions import (
-    default_session_dir,
-    delete_named_session,
-    list_sessions,
-    load_session,
-    rename_named_session,
-    save_named_session,
-    save_session,
-)
 from crater_app import __version__
+from crater_app.core.activity import ActivityScan, scan_activity
+from crater_app.core.analysis import AnalysisEngine
+from crater_app.core.guided_profile import GuideSample, densify_guide, guide_for_frame
+from crater_app.core.series import (
+    SERIES_FIELDS,
+    FrameMeasurement,
+    keyframe_span,
+    measure_frame,
+    measure_series,
+)
+from crater_app.core.session import (
+    Calibration,
+    Session,
+    find_sessions_for_video,
+    load_session_file,
+    save_session_file,
+)
+from crater_app.core.video_reader import VideoReader
+from crater_app.desktop import theme
+from crater_app.desktop.canvas import FrameCanvas, Overlays
+from crater_app.desktop.section import SectionView
+from crater_app.desktop.sessions import _sanitize_name, default_session_dir
+from crater_app.desktop.timeline import Timeline
+
+Point = Tuple[float, float]
+WEAK_EDGE = 0.30
+DEFAULT_FRAME_WIDTH_MM = 124.0
+DOCS_URL = "https://github.com/braydenherzberg/crater_tracker/blob/main/docs/analysis_method.md"
 
 
-@dataclass
-class StarredEntry:
-    frame_index: int
-    settings: AnalysisSettings
-    profile_points: List[Tuple[int, int]]
-    frame_width_px: int
-    crater_points: Optional[List[Tuple[int, int]]] = None
-    baseline_points: Optional[List[Tuple[int, int]]] = None
-    confidence: float = 0.0
+class Worker(QThread):
+    """Runs a function in the background, reporting progress in 0..1."""
+
+    progressed = Signal(float)
+    done = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, fn, *args, **kwargs) -> None:
+        super().__init__()
+        self._fn, self._args, self._kwargs = fn, args, kwargs
+        self.cancel_requested = False
+
+    def run(self) -> None:
+        try:
+            result = self._fn(
+                *self._args,
+                progress=self.progressed.emit,
+                cancelled=lambda: self.cancel_requested,
+                **self._kwargs,
+            )
+            self.done.emit(result)
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user
+            self.failed.emit(str(exc))
 
 
-def frame_to_pixmap(frame_bgr: np.ndarray) -> QPixmap:
-    rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-    h, w, _ = rgb.shape
-    image = QImage(rgb.data, w, h, 3 * w, QImage.Format_RGB888)
-    return QPixmap.fromImage(image)
+def resample_points(points: List[Point], count: int) -> List[Point]:
+    dense = np.asarray(densify_guide(points, 1))
+    xs = np.linspace(dense[0, 0], dense[-1, 0], max(3, count))
+    ys = np.interp(xs, dense[:, 0], dense[:, 1])
+    return [(round(float(x), 1), round(float(y), 1)) for x, y in zip(xs, ys)]
 
 
-class AnnotatableVideoLabel(QLabel):
-    clicked = Signal(int, int)
-
-    def mousePressEvent(self, event):  # type: ignore[override]
-        if event.button() == Qt.LeftButton:
-            position = event.position()
-            self.clicked.emit(int(position.x()), int(position.y()))
-        super().mousePressEvent(event)
+def section_title(text: str) -> QLabel:
+    label = QLabel(text.upper())
+    label.setObjectName("sectionTitle")
+    return label
 
 
-class CraterDashboardWindow(QMainWindow):
-    LABEL_TOOLTIPS: Dict[str, str] = {
-        "Threshold": "Binary threshold used to separate crater/solid pixels from background.",
-        "Smoothing": "Moving-average smoothing strength for the green profile trace.",
-        "Despeckle": "Median filter window used before smoothing to suppress outliers.",
-        "Channel": "Image channel used for detection (Grayscale, Blue, Green, Red).",
-        "Crater Left Boundary": "Left offset from frame center defining crater search zone.",
-        "Crater Right Boundary": "Right offset from frame center defining crater search zone.",
-        "Surface Boundary": "Reference baseline used for depth/area calculations.",
-        "Scan Mode": "Bottom-Up or Top-Down scan mode for locating profile edge.",
-        "Tilt (-7..+7, 0.25)": "Frame rotation before analysis in 0.25 degree increments.",
-        "Real Width (mm)": "Real-world width of full frame used for mm calibration.",
-        "Guide Left": "Left margin of the blue guide rectangle in pixels.",
-        "Guide Right": "Right margin of the blue guide rectangle in pixels.",
-        "Guide Top": "Top margin of the blue guide rectangle in pixels.",
-    }
-
+class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(f"Crater Side-Profile Analyzer {__version__}")
-
-        self.settings_store = QSettings("CraterProject", "CraterDesktop")
+        self.settings = QSettings("CraterProject", "CraterAnalyzer")
+        self.session_dir = default_session_dir()
         self.engine = AnalysisEngine()
         self.video: Optional[VideoReader] = None
-        self.current_video_path: Optional[str] = None
-        self.analysis_settings = AnalysisSettings()
-        self.current_result: Optional[AnalysisResult] = None
-        self.current_frame_index = 0
-        self.stabilized_frame_index: Optional[int] = None
-        self.stabilized_frame: Optional[np.ndarray] = None
-        self.starred_frames: Dict[int, StarredEntry] = {}
-        self.guide_keyframes: Dict[int, List[Tuple[int, int]]] = {}
-        self.guide_drafts: Dict[int, List[Tuple[int, int]]] = {}
-        self._composed_shape: Optional[Tuple[int, int]] = None
-        self._source_frame_height = 0
-        self.run_fps: float = 30.0
-
-        self.preset_dir = default_preset_dir()
-        self.preset_dir.mkdir(parents=True, exist_ok=True)
-        self.session_dir = default_session_dir()
-        self.session_dir.mkdir(parents=True, exist_ok=True)
-
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self._advance_frame)
+        self.video_path: Optional[str] = None
+        self.frame_index = 0
+        self.keyframes: Dict[int, List[Point]] = {}
+        self.draft: Optional[Tuple[int, List[Point]]] = None  # uncommitted line
+        self.undo_stack: List[Tuple[Dict[int, List[Point]], Optional[Tuple[int, List[Point]]]]] = []
+        self.redo_stack: List[Tuple[Dict[int, List[Point]], Optional[Tuple[int, List[Point]]]]] = []
+        self.calibration: Optional[Calibration] = None
+        self.session_extra: Dict = {}
+        self.session_path: Optional[Path] = None
+        self.dirty = False
+        self.activity: Optional[ActivityScan] = None
+        self.keyframe_widths: Dict[int, float] = {}
+        self.measurement: Optional[FrameMeasurement] = None
+        self.worker: Optional[Worker] = None
+        self.play_timer = QTimer(self)
+        self.play_timer.timeout.connect(lambda: self.step(1, wrap=False))
+        # Background tracking pass over the keyframe span, re-run after edits.
+        self.track_timer = QTimer(self)
+        self.track_timer.setSingleShot(True)
+        self.track_timer.setInterval(900)
+        self.track_timer.timeout.connect(self.run_tracking)
+        self.track_worker: Optional[Worker] = None
+        self.track_rows: List[Dict] = []
 
         self._build_ui()
-        self._restore_window_state()
+        self._build_menus()
+        self.setStyleSheet(theme.STYLESHEET)
+        self._update_title()
+        self._refresh_all()
+        geometry = self.settings.value("geometry")
+        if geometry is not None:
+            self.restoreGeometry(geometry)
+        else:
+            self.resize(1440, 900)
 
-    def closeEvent(self, event):  # type: ignore[override]
-        if self.video is not None:
-            self.video.release()
-        self._persist_window_state()
-        super().closeEvent(event)
-
-    def resizeEvent(self, event):  # type: ignore[override]
-        super().resizeEvent(event)
-        self._render_current()
-
+    # ================================================================= layout
     def _build_ui(self) -> None:
         central = QWidget()
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-
-        header = QFrame()
-        header.setObjectName("appHeader")
-        header_row = QHBoxLayout(header)
-        header_row.setContentsMargins(22, 14, 18, 14)
-        brand_col = QVBoxLayout()
-        brand_col.setSpacing(1)
-        brand = QLabel("CRATER")
-        brand.setObjectName("brandLabel")
-        brand_col.addWidget(brand)
-        self.video_name_label = QLabel("No run loaded")
-        self.video_name_label.setObjectName("runLabel")
-        brand_col.addWidget(self.video_name_label)
-        header_row.addLayout(brand_col)
-        header_row.addStretch(1)
-        open_btn = QPushButton("Open video")
-        open_btn.setObjectName("secondaryButton")
-        open_btn.clicked.connect(self._choose_video)
-        header_row.addWidget(open_btn)
-        auto_find_btn = QPushButton("Analyze run")
-        auto_find_btn.setObjectName("primaryButton")
-        auto_find_btn.setToolTip(
-            "Find the experiment event, reject transient low-visibility frames, "
-            "and select a stable crater candidate."
-        )
-        auto_find_btn.clicked.connect(self._auto_find_crater)
-        header_row.addWidget(auto_find_btn)
-        root.addWidget(header)
-
-        workspace = QWidget()
-        workspace_row = QHBoxLayout(workspace)
-        workspace_row.setContentsMargins(16, 16, 16, 16)
-        workspace_row.setSpacing(16)
-
-        viewer = QFrame()
-        viewer.setObjectName("viewer")
-        viewer_col = QVBoxLayout(viewer)
-        viewer_col.setContentsMargins(0, 0, 0, 0)
-        viewer_col.setSpacing(0)
-
-        self.video_label = AnnotatableVideoLabel(
-            "Open a side-camera run to begin.\n\n"
-            "Automatic analysis will locate the event and select a stable review frame."
-        )
-        self.video_label.setAlignment(Qt.AlignCenter)
-        self.video_label.setMinimumSize(320, 220)
-        self.video_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        self.video_label.setObjectName("videoCanvas")
-        self.video_label.clicked.connect(self._add_guide_point_from_view)
-        viewer_col.addWidget(self.video_label, 1)
-
-        transport = QFrame()
-        transport.setObjectName("transport")
-        transport_row = QHBoxLayout(transport)
-        transport_row.setContentsMargins(14, 10, 14, 10)
-        transport_row.setSpacing(8)
-        back_btn = QPushButton("−1")
-        back_btn.setToolTip("Previous frame")
-        back_btn.clicked.connect(lambda: self._step_frame(-1))
-        transport_row.addWidget(back_btn)
-        self.play_btn = QPushButton("Play")
-        self.play_btn.clicked.connect(self._toggle_play)
-        transport_row.addWidget(self.play_btn)
-        forward_btn = QPushButton("+1")
-        forward_btn.setToolTip("Next frame")
-        forward_btn.clicked.connect(lambda: self._step_frame(1))
-        transport_row.addWidget(forward_btn)
-        self.frame_slider = QSlider(Qt.Horizontal)
-        self.frame_slider.setMinimum(0)
-        self.frame_slider.setMaximum(0)
-        self.frame_slider.valueChanged.connect(self._on_frame_changed)
-        transport_row.addWidget(self.frame_slider, 1)
-        self.frame_position_label = QLabel("Frame —")
-        self.frame_position_label.setMinimumWidth(150)
-        self.frame_position_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        transport_row.addWidget(self.frame_position_label)
-        viewer_col.addWidget(transport)
-        workspace_row.addWidget(viewer, 1)
-
-        controls_panel = QWidget()
-        controls_panel.setMinimumWidth(360)
-        controls_panel.setMaximumWidth(420)
-        controls_panel.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        controls_col = QVBoxLayout()
-        controls_col.setContentsMargins(8, 0, 8, 8)
-        controls_col.setSpacing(10)
-        controls_panel.setLayout(controls_col)
-
-        controls_scroll = QScrollArea()
-        controls_scroll.setObjectName("inspector")
-        controls_scroll.setWidgetResizable(True)
-        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        controls_scroll.setWidget(controls_panel)
-        controls_scroll.setMinimumWidth(390)
-        controls_scroll.setMaximumWidth(420)
-        controls_scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        workspace_row.addWidget(controls_scroll, 0)
-        root.addWidget(workspace, 1)
-
-        inspector_title = QLabel("Review & measure")
-        inspector_title.setObjectName("inspectorTitle")
-        controls_col.addWidget(inspector_title)
-        controls_col.addWidget(self._build_metrics_panel())
-        controls_col.addWidget(self._build_guided_tracking_panel())
-        controls_col.addWidget(self._build_analysis_controls())
-        controls_col.addWidget(self._build_overlay_controls())
-        controls_col.addWidget(self._build_starred_frames_panel())
-        controls_col.addWidget(self._build_export_controls())
-        controls_col.addWidget(self._build_presets_controls())
-        controls_col.addStretch(1)
-
+        root.addWidget(self._build_header())
+        body = QHBoxLayout()
+        body.setSpacing(0)
+        body.addWidget(self._build_rail())
+        body.addWidget(self._build_center(), 1)
+        body.addWidget(self._build_inspector())
+        root.addLayout(body, 1)
+        root.addWidget(self._build_statusbar())
         self.setCentralWidget(central)
-        self._apply_visual_system()
 
-    def _apply_visual_system(self) -> None:
-        self.setStyleSheet(
-            """
-            QMainWindow, QWidget { background: #11161c; color: #dce5ed; font-size: 13px; }
-            #appHeader { background: #171e26; border-bottom: 1px solid #26313c; }
-            #brandLabel { color: #f4f8fb; font-size: 22px; font-weight: 800; letter-spacing: 4px; }
-            #runLabel { color: #8795a3; font-size: 12px; }
-            #viewer { background: #090d11; border: 1px solid #26313c; border-radius: 8px; }
-            #videoCanvas { background: #090d11; color: #6f7e8c; font-size: 15px; }
-            #transport { background: #171e26; border-top: 1px solid #26313c; }
-            #inspector { border: 0; background: #11161c; }
-            #inspectorTitle { color: #f4f8fb; font-size: 20px; font-weight: 700; padding: 5px 0 2px 2px; }
-            QGroupBox { border: 0; border-top: 1px solid #2a3540; margin-top: 14px; padding-top: 12px; font-weight: 700; color: #aebbc7; }
-            QGroupBox::title { subcontrol-origin: margin; left: 0; padding: 0 7px 0 0; }
-            QPushButton { background: #202a34; border: 1px solid #33414e; border-radius: 5px; padding: 7px 11px; color: #e7edf2; }
-            QPushButton:hover { background: #293641; border-color: #4b5d6d; }
-            QPushButton:disabled { color: #596673; background: #171d24; border-color: #26303a; }
-            #primaryButton { background: #25a7c6; border-color: #25a7c6; color: #071116; font-weight: 800; padding: 9px 16px; }
-            #primaryButton:hover { background: #49bdd6; }
-            #secondaryButton { padding: 9px 14px; }
-            #guideButton:checked { background: #d5a72d; border-color: #f0c54b; color: #11161c; font-weight: 800; }
-            #guideHint { color: #94a2af; font-size: 12px; line-height: 1.3; }
-            QComboBox, QDoubleSpinBox { background: #171e26; border: 1px solid #33414e; border-radius: 4px; padding: 5px; }
-            QListWidget { background: #0e1318; border: 1px solid #2a3540; border-radius: 4px; }
-            QScrollBar:vertical { background: #11161c; width: 10px; }
-            QScrollBar::handle:vertical { background: #364552; border-radius: 5px; min-height: 28px; }
-            QSlider::groove:horizontal { height: 4px; background: #34414c; border-radius: 2px; }
-            QSlider::handle:horizontal { background: #25a7c6; width: 14px; margin: -5px 0; border-radius: 7px; }
-            QCheckBox { spacing: 8px; }
-            """
+    def _build_header(self) -> QWidget:
+        header = QFrame()
+        header.setObjectName("header")
+        header.setFixedHeight(46)
+        row = QHBoxLayout(header)
+        row.setContentsMargins(12, 0, 12, 0)
+        row.setSpacing(10)
+        brand = QLabel("CRATER")
+        brand.setObjectName("brand")
+        row.addWidget(brand)
+        self.open_button = QPushButton("Open video…")
+        self.open_button.setToolTip("Open a side-camera video (⌘O / Ctrl+O)")
+        self.open_button.clicked.connect(self.choose_video)
+        row.addWidget(self.open_button)
+        self.meta_label = QLabel("")
+        self.meta_label.setObjectName("muted")
+        self.meta_label.setFont(theme.mono_font(10))
+        row.addWidget(self.meta_label)
+        row.addStretch(1)
+        self.find_event_button = QPushButton("Find event")
+        self.find_event_button.setToolTip(
+            "Scan the whole run for the experiment event and jump to where the scene settles"
         )
+        self.find_event_button.clicked.connect(self.find_event)
+        row.addWidget(self.find_event_button)
+        sep = QFrame()
+        sep.setFixedSize(1, 22)
+        sep.setStyleSheet(f"background: {theme.LINE_STRONG};")
+        row.addWidget(sep)
+        label = QLabel("Session")
+        label.setObjectName("muted")
+        row.addWidget(label)
+        self.session_name = QLineEdit()
+        self.session_name.setFixedWidth(210)
+        self.session_name.setFont(theme.mono_font(10))
+        self.session_name.setToolTip(
+            "Saved to the session library. Names starting with gt_ are used as benchmark ground truth."
+        )
+        self.session_name.returnPressed.connect(self.save_session)
+        row.addWidget(self.session_name)
+        self.save_button = QPushButton("Save")
+        self.save_button.setObjectName("primary")
+        self.save_button.setToolTip("Save session (⌘S / Ctrl+S)")
+        self.save_button.clicked.connect(self.save_session)
+        row.addWidget(self.save_button)
+        return header
 
-    def _build_guided_tracking_panel(self) -> QGroupBox:
-        group = QGroupBox("Guided crater line")
-        layout = QVBoxLayout(group)
-        self.guided_tracking_check = QCheckBox("Use guided tracking")
-        self.guided_tracking_check.setChecked(True)
-        self.guided_tracking_check.setToolTip(
-            "Require operator-defined crater lines instead of guessing which visible interface is the crater."
-        )
-        self.guided_tracking_check.stateChanged.connect(
-            self._on_guided_tracking_changed
-        )
-        layout.addWidget(self.guided_tracking_check)
+    def _tool(self, label: str, key: str, tip: str, checkable: bool = False) -> QToolButton:
+        button = QToolButton()
+        button.setObjectName("tool")
+        button.setText(f"{label}\n{key}")
+        button.setToolTip(f"{tip}  ({key})")
+        button.setCheckable(checkable)
+        button.setFixedSize(58, 46)
+        return button
 
-        hint = QLabel(
-            "Scrub to a clear frame, choose Draw line, then trace the subsurface "
-            "interface left-to-right with level material on both sides."
+    def _build_rail(self) -> QWidget:
+        rail = QFrame()
+        rail.setObjectName("rail")
+        rail.setFixedWidth(68)
+        col = QVBoxLayout(rail)
+        col.setContentsMargins(5, 10, 5, 10)
+        col.setSpacing(4)
+        self.edit_tool = self._tool("Edit", "D", "Edit the crater line on this frame", True)
+        self.edit_tool.toggled.connect(self.set_edit_mode)
+        self.keep_tool = self._tool("Keep", "S", "Keep this line as a keyframe (locks an interpolated line)")
+        self.keep_tool.clicked.connect(self.keep_keyframe)
+        self.undo_tool = self._tool("Undo", "⌘Z", "Undo the last line edit")
+        self.undo_tool.clicked.connect(self.undo)
+        self.clear_tool = self._tool("Clear", "X", "Remove this frame's keyframe")
+        self.clear_tool.clicked.connect(self.clear_frame)
+        self.snap_tool = self._tool("Snap", "E", "Snap the tracked line to the image edge within 14 px", True)
+        self.snap_tool.setChecked(True)
+        self.snap_tool.toggled.connect(lambda _: (self._refresh_frame(), self.track_timer.start()))
+        self.enhance_tool = self._tool("Contrast", "C", "Enhance low contrast (display only)", True)
+        self.enhance_tool.toggled.connect(lambda _: self._refresh_frame())
+        self.median_tool = self._tool("Median", "T", "Temporal median of 7 frames: suppresses moving dust", True)
+        self.median_tool.toggled.connect(lambda _: self._refresh_frame())
+        self.scale_tool = self._tool("Scale", "K", "Calibrate: click two points a known distance apart", True)
+        self.scale_tool.toggled.connect(self.set_calibrate_mode)
+        self.snapshot_tool = self._tool("Image", "P", "Save the frame with overlays as a full-resolution PNG")
+        self.snapshot_tool.clicked.connect(self.save_snapshot)
+        for widget in (self.edit_tool, self.keep_tool, self.undo_tool, self.clear_tool):
+            col.addWidget(widget)
+        col.addSpacing(10)
+        for widget in (self.snap_tool, self.enhance_tool, self.median_tool):
+            col.addWidget(widget)
+        col.addSpacing(10)
+        for widget in (self.scale_tool, self.snapshot_tool):
+            col.addWidget(widget)
+        col.addStretch(1)
+        return rail
+
+    def _build_center(self) -> QWidget:
+        center = QWidget()
+        col = QVBoxLayout(center)
+        col.setContentsMargins(10, 8, 10, 8)
+        col.setSpacing(6)
+        bar = QHBoxLayout()
+        self.mode_label = QLabel("")
+        self.mode_label.setFont(theme.mono_font(10))
+        bar.addWidget(self.mode_label, 1)
+        self.show_clicks = QCheckBox("clicks")
+        self.show_tracked = QCheckBox("tracked")
+        self.show_geometry = QCheckBox("baseline + rims")
+        for box in (self.show_clicks, self.show_tracked, self.show_geometry):
+            box.setChecked(True)
+            box.toggled.connect(self._apply_overlay_visibility)
+            bar.addWidget(box)
+        col.addLayout(bar)
+        self.canvas = FrameCanvas()
+        self.canvas.pointsEdited.connect(self.on_points_edited)
+        self.canvas.calibrationPicked.connect(self.on_calibration_picked)
+        self.canvas.cursorMoved.connect(self.on_cursor_moved)
+        col.addWidget(self.canvas, 1)
+        self.section = SectionView()
+        self.section.setFixedHeight(104)
+        col.addWidget(self.section)
+
+        transport = QHBoxLayout()
+        transport.setSpacing(4)
+
+        def nav(text: str, tip: str, fn) -> QPushButton:
+            button = QPushButton(text)
+            button.setToolTip(tip)
+            button.setFixedHeight(26)
+            button.setFocusPolicy(Qt.NoFocus)
+            button.clicked.connect(fn)
+            transport.addWidget(button)
+            return button
+
+        nav("«", "Back 24 frames (Shift+←)", lambda: self.step(-24))
+        nav("‹", "Back 1 frame (←)", lambda: self.step(-1))
+        self.play_button = nav("Play", "Play / pause (Space)", self.toggle_play)
+        nav("›", "Forward 1 frame (→)", lambda: self.step(1))
+        nav("»", "Forward 24 frames (Shift+→)", lambda: self.step(24))
+        transport.addSpacing(8)
+        goto_label = QLabel("Go to")
+        goto_label.setObjectName("muted")
+        transport.addWidget(goto_label)
+        self.goto = QSpinBox()
+        self.goto.setFont(theme.mono_font(10))
+        self.goto.setFixedWidth(86)
+        self.goto.setKeyboardTracking(False)
+        self.goto.setButtonSymbols(QSpinBox.NoButtons)
+        self.goto.valueChanged.connect(self.seek)
+        transport.addWidget(self.goto)
+        self.time_label = QLabel("")
+        self.time_label.setFont(theme.mono_font(10))
+        transport.addWidget(self.time_label)
+        transport.addStretch(1)
+        nav("◆ prev  [", "Previous keyframe ([)", lambda: self.jump_keyframe(-1))
+        nav("next ◆  ]", "Next keyframe (])", lambda: self.jump_keyframe(1))
+        col.addLayout(transport)
+        self.timeline = Timeline()
+        self.timeline.setFixedHeight(118)
+        self.timeline.seekRequested.connect(self.seek)
+        col.addWidget(self.timeline)
+        return center
+
+    def _build_inspector(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("inspector")
+        panel.setFixedWidth(330)
+        col = QVBoxLayout(panel)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+
+        # ---- measurement
+        box = QFrame()
+        box.setObjectName("section")
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(14, 12, 14, 12)
+        head = QHBoxLayout()
+        head.addWidget(section_title("Measurement"))
+        head.addStretch(1)
+        self.source_badge = QLabel("")
+        self.source_badge.setObjectName("badge")
+        self.source_badge.setFont(theme.mono_font(10))
+        head.addWidget(self.source_badge)
+        lay.addLayout(head)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(8)
+        self.value_labels: Dict[str, Tuple[QLabel, QLabel]] = {}
+        for i, (key, title) in enumerate(
+            [("width", "Width, rim–rim"), ("depth", "Max depth"), ("area", "Section area"), ("tilt", "Baseline tilt")]
+        ):
+            cell = QVBoxLayout()
+            cell.setSpacing(0)
+            name = QLabel(title)
+            name.setObjectName("muted")
+            name.setStyleSheet("font-size: 11px;")
+            value = QLabel("—")
+            value.setObjectName("value")
+            value.setFont(theme.mono_font(15))
+            sub = QLabel("")
+            sub.setObjectName("dim")
+            sub.setFont(theme.mono_font(9))
+            cell.addWidget(name)
+            cell.addWidget(value)
+            cell.addWidget(sub)
+            grid.addLayout(cell, i // 2, i % 2)
+            self.value_labels[key] = (value, sub)
+        lay.addLayout(grid)
+        self.quality_label = QLabel("")
+        self.quality_label.setObjectName("dim")
+        self.quality_label.setFont(theme.mono_font(9))
+        lay.addWidget(self.quality_label)
+        self.warning_label = QLabel("")
+        self.warning_label.setObjectName("warning")
+        self.warning_label.setWordWrap(True)
+        lay.addWidget(self.warning_label)
+        col.addWidget(box)
+
+        # ---- keyframes
+        box = QFrame()
+        box.setObjectName("section")
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(14, 12, 14, 12)
+        head = QHBoxLayout()
+        head.addWidget(section_title("Keyframes"))
+        head.addStretch(1)
+        self.keyframe_count = QLabel("")
+        self.keyframe_count.setObjectName("muted")
+        self.keyframe_count.setFont(theme.mono_font(9))
+        head.addWidget(self.keyframe_count)
+        lay.addLayout(head)
+        self.keyframe_table = QTableWidget(0, 4)
+        self.keyframe_table.setHorizontalHeaderLabels(["frame", "t (s)", "pts", "width mm"])
+        self.keyframe_table.verticalHeader().setVisible(False)
+        self.keyframe_table.setShowGrid(False)
+        self.keyframe_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.keyframe_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.keyframe_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.keyframe_table.setFocusPolicy(Qt.NoFocus)
+        self.keyframe_table.setFont(theme.mono_font(10))
+        self.keyframe_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.keyframe_table.verticalHeader().setDefaultSectionSize(22)
+        self.keyframe_table.setMinimumHeight(150)
+        self.keyframe_table.cellClicked.connect(
+            lambda row, _col: self.seek(int(self.keyframe_table.item(row, 0).data(Qt.UserRole)))
         )
-        hint.setObjectName("guideHint")
+        lay.addWidget(self.keyframe_table, 1)
+        hint = QLabel("D edit · click adds · drag moves · right-click deletes · S keeps an interpolated line")
+        hint.setObjectName("dim")
         hint.setWordWrap(True)
-        layout.addWidget(hint)
+        lay.addWidget(hint)
+        col.addWidget(box, 1)
 
-        self.draw_guide_btn = QPushButton("Draw line on this frame")
-        self.draw_guide_btn.setObjectName("guideButton")
-        self.draw_guide_btn.setCheckable(True)
-        self.draw_guide_btn.toggled.connect(self._on_guide_draw_toggled)
-        layout.addWidget(self.draw_guide_btn)
+        # ---- calibration
+        box = QFrame()
+        box.setObjectName("section")
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.addWidget(section_title("Calibration"))
+        row = QHBoxLayout()
+        width_label = QLabel("Frame width")
+        width_label.setObjectName("muted")
+        row.addWidget(width_label)
+        self.frame_width_mm = QDoubleSpinBox()
+        self.frame_width_mm.setRange(1.0, 100000.0)
+        self.frame_width_mm.setDecimals(2)
+        self.frame_width_mm.setSuffix(" mm")
+        self.frame_width_mm.setFont(theme.mono_font(10))
+        self.frame_width_mm.setKeyboardTracking(False)
+        self.frame_width_mm.setValue(float(self.settings.value("frame_width_mm", DEFAULT_FRAME_WIDTH_MM)))
+        self.frame_width_mm.valueChanged.connect(self.on_frame_width_changed)
+        row.addWidget(self.frame_width_mm, 1)
+        scale_button = QPushButton("Measure…")
+        scale_button.setToolTip("Click two points a known distance apart (K)")
+        scale_button.clicked.connect(lambda: self.scale_tool.setChecked(True))
+        row.addWidget(scale_button)
+        lay.addLayout(row)
+        self.calibration_label = QLabel("")
+        self.calibration_label.setObjectName("dim")
+        self.calibration_label.setFont(theme.mono_font(9))
+        self.calibration_label.setWordWrap(True)
+        lay.addWidget(self.calibration_label)
+        col.addWidget(box)
 
-        edit_row = QHBoxLayout()
-        self.undo_guide_btn = QPushButton("Undo point")
-        self.undo_guide_btn.clicked.connect(self._undo_guide_point)
-        edit_row.addWidget(self.undo_guide_btn)
-        self.save_guide_btn = QPushButton("Save keyframe")
-        self.save_guide_btn.clicked.connect(self._save_guide_keyframe)
-        edit_row.addWidget(self.save_guide_btn)
-        layout.addLayout(edit_row)
+        # ---- export
+        box = QFrame()
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(14, 12, 14, 14)
+        lay.addWidget(section_title("Export time series"))
+        row = QHBoxLayout()
+        every = QLabel("Every")
+        every.setObjectName("muted")
+        row.addWidget(every)
+        self.export_step = QSpinBox()
+        self.export_step.setRange(1, 10000)
+        self.export_step.setValue(10)
+        self.export_step.setSuffix(" fr")
+        self.export_step.setFont(theme.mono_font(10))
+        self.export_step.valueChanged.connect(lambda _: self._refresh_export())
+        row.addWidget(self.export_step)
+        self.export_profiles = QCheckBox("profiles")
+        self.export_profiles.setToolTip("Also write every profile point (x, y, baseline) per frame")
+        row.addWidget(self.export_profiles)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self.export_range = QLabel("")
+        self.export_range.setObjectName("dim")
+        self.export_range.setFont(theme.mono_font(9))
+        lay.addWidget(self.export_range)
+        self.export_button = QPushButton("Export CSV…")
+        self.export_button.setToolTip("Measure every sampled frame between the first and last keyframe (⌘E)")
+        self.export_button.clicked.connect(self.export_series)
+        lay.addWidget(self.export_button)
+        col.addWidget(box)
+        return panel
 
-        clear_row = QHBoxLayout()
-        clear_current_btn = QPushButton("Clear frame")
-        clear_current_btn.clicked.connect(self._clear_current_guide)
-        clear_row.addWidget(clear_current_btn)
-        clear_all_btn = QPushButton("Clear all")
-        clear_all_btn.clicked.connect(self._clear_all_guides)
-        clear_row.addWidget(clear_all_btn)
-        layout.addLayout(clear_row)
+    def _build_statusbar(self) -> QWidget:
+        bar = QFrame()
+        bar.setObjectName("statusbar")
+        bar.setFixedHeight(24)
+        row = QHBoxLayout(bar)
+        row.setContentsMargins(12, 0, 12, 0)
+        self.cursor_label = QLabel("")
+        self.status_label = QLabel("")
+        hint = QLabel("←/→ 1 fr · ⇧←/→ 24 · [ ] keyframe · N weak frame · Space play · wheel zoom · F fit · alt-drag pan")
+        for label in (self.cursor_label, self.status_label, hint):
+            label.setObjectName("muted")
+            label.setFont(theme.mono_font(9))
+        row.addWidget(self.cursor_label)
+        row.addSpacing(16)
+        row.addWidget(self.status_label, 1)
+        row.addWidget(hint)
+        return bar
 
-        self.snap_guide_check = QCheckBox("Track nearby edge (14 px limit)")
-        self.snap_guide_check.setChecked(True)
-        self.snap_guide_check.setToolTip(
-            "Refine each interpolated point using only image evidence within 14 pixels of the guide."
+    def _build_menus(self) -> None:
+        menu = self.menuBar()
+
+        def action(parent, text, shortcut, fn, checkable_tool: Optional[QToolButton] = None) -> QAction:
+            act = QAction(text, self)
+            if shortcut:
+                act.setShortcut(QKeySequence(shortcut))
+            act.setShortcutContext(Qt.WindowShortcut)
+            act.triggered.connect(fn)
+            if parent is not None:
+                parent.addAction(act)
+            else:
+                self.addAction(act)
+            return act
+
+        file_menu = menu.addMenu("&File")
+        action(file_menu, "Open Video…", QKeySequence.Open, self.choose_video)
+        action(file_menu, "Open Session…", "Ctrl+Shift+O", self.open_session_dialog)
+        action(file_menu, "Save Session", QKeySequence.Save, self.save_session)
+        file_menu.addSeparator()
+        action(file_menu, "Export Time Series CSV…", "Ctrl+E", self.export_series)
+        action(file_menu, "Save Snapshot…", "P", self.save_snapshot)
+        file_menu.addSeparator()
+        action(
+            file_menu,
+            "Show Session Folder",
+            None,
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.session_dir))),
         )
-        self.snap_guide_check.stateChanged.connect(self._render_current)
-        layout.addWidget(self.snap_guide_check)
+        edit_menu = menu.addMenu("&Edit")
+        action(edit_menu, "Undo Line Edit", QKeySequence.Undo, self.undo)
+        action(edit_menu, "Redo Line Edit", QKeySequence.Redo, self.redo)
+        edit_menu.addSeparator()
+        action(edit_menu, "Edit Line", "D", self.edit_tool.toggle)
+        action(edit_menu, "Keep as Keyframe", "S", self.keep_keyframe)
+        action(edit_menu, "Clear Frame", "X", self.clear_frame)
+        action(edit_menu, "Measure Scale", "K", self.scale_tool.toggle)
+        view_menu = menu.addMenu("&View")
+        action(view_menu, "Snap to Edge", "E", self.snap_tool.toggle)
+        action(view_menu, "Enhance Contrast", "C", self.enhance_tool.toggle)
+        action(view_menu, "Temporal Median", "T", self.median_tool.toggle)
+        action(view_menu, "Fit Frame", "F", self.canvas.reset_view)
+        go_menu = menu.addMenu("&Go")
+        action(go_menu, "Next Frame", "Right", lambda: self.step(1))
+        action(go_menu, "Previous Frame", "Left", lambda: self.step(-1))
+        action(go_menu, "Forward 24 Frames", "Shift+Right", lambda: self.step(24))
+        action(go_menu, "Back 24 Frames", "Shift+Left", lambda: self.step(-24))
+        action(go_menu, "Next Keyframe", "]", lambda: self.jump_keyframe(1))
+        action(go_menu, "Previous Keyframe", "[", lambda: self.jump_keyframe(-1))
+        action(go_menu, "Play / Pause", "Space", self.toggle_play)
+        action(go_menu, "Next Weak Frame", "N", self.next_weak_frame)
+        action(go_menu, "Find Event", None, self.find_event)
+        action(None, "Undo (Backspace)", "Backspace", self.undo)
+        action(None, "Stop Editing", "Escape", self.escape)
+        help_menu = menu.addMenu("&Help")
+        action(help_menu, "Measurement Method", None, lambda: QDesktopServices.openUrl(QUrl(DOCS_URL)))
+        action(help_menu, f"About Crater {__version__}", None, self.show_about)
 
-        self.guide_keyframe_list = QListWidget()
-        self.guide_keyframe_list.setMaximumHeight(96)
-        self.guide_keyframe_list.itemClicked.connect(self._jump_to_guide_keyframe)
-        layout.addWidget(self.guide_keyframe_list)
-        self.guide_status_label = QLabel("No guide keyframes")
-        self.guide_status_label.setObjectName("guideHint")
-        layout.addWidget(self.guide_status_label)
-        return group
-
-    def _build_analysis_controls(self) -> QGroupBox:
-        group = QGroupBox("Detection")
-        form = QFormLayout(group)
-        form.setRowWrapPolicy(QFormLayout.DontWrapRows)
-
-        self.auto_surface_check = QCheckBox("Legacy automatic surface tracking")
-        self.auto_surface_check.setChecked(self.analysis_settings.auto_surface)
-        self.auto_surface_check.setEnabled(not self.guided_tracking_check.isChecked())
-        self.auto_surface_check.setToolTip(
-            "Automatically trace the material/air boundary and infer crater rims, "
-            "baseline, depth, width, and area."
-        )
-        self.auto_surface_check.stateChanged.connect(self._sync_settings)
-
-        self.threshold_slider, self.threshold_label, threshold_row = self._slider_control(
-            0, 255, self.analysis_settings.threshold
-        )
-        self.smoothing_slider, self.smoothing_label, smoothing_row = self._slider_control(
-            1, 100, self.analysis_settings.smoothing
-        )
-        self.despeckle_slider, self.despeckle_label, despeckle_row = self._slider_control(
-            0, 51, self.analysis_settings.despeckle
-        )
-        self.zone_left_slider, self.zone_left_label, zone_left_row = self._slider_control(
-            0, 4000, self.analysis_settings.zone_left
-        )
-        self.zone_right_slider, self.zone_right_label, zone_right_row = self._slider_control(
-            0, 4000, self.analysis_settings.zone_right
-        )
-        self.surface_slider, self.surface_label, surface_row = self._slider_control(
-            0, 4000, self.analysis_settings.surface_boundary
-        )
-        self.tilt_slider, self.tilt_label, tilt_row = self._slider_control(0, 56, 28)
-
-        self.channel_combo = QComboBox()
-        self.channel_combo.addItems(["Grayscale", "Blue", "Green", "Red"])
-        self.channel_combo.setCurrentIndex(self.analysis_settings.channel)
-        self.channel_combo.currentIndexChanged.connect(lambda _: self._sync_settings())
-        self.channel_combo.setToolTip("Choose image channel: Grayscale, Blue, Green, or Red.")
-
-        self.scan_toggle = QPushButton()
-        self.scan_toggle.setCheckable(True)
-        self.scan_toggle.setChecked(self.analysis_settings.scan_mode == 1)
-        self.scan_toggle.clicked.connect(self._sync_settings)
-        self.scan_toggle.setToolTip("Toggle between Bottom-Up and Top-Down scan modes.")
-
-        self.real_width_spin = QDoubleSpinBox()
-        self.real_width_spin.setRange(0.1, 10000.0)
-        self.real_width_spin.setDecimals(1)
-        self.real_width_spin.setSingleStep(1.0)
-        self.real_width_spin.setValue(self.analysis_settings.real_width_mm)
-        self.real_width_spin.setSuffix(" mm")
-        self.real_width_spin.setToolTip("Physical width of the full camera view in mm (for calibration).")
-        self.real_width_spin.valueChanged.connect(lambda _: self._sync_settings())
-
-        self.threshold_slider.setToolTip("Threshold")
-        self.smoothing_slider.setToolTip("Smoothing")
-        self.despeckle_slider.setToolTip("Despeckle")
-        self.zone_left_slider.setToolTip("Crater Left Boundary")
-        self.zone_right_slider.setToolTip("Crater Right Boundary")
-        self.surface_slider.setToolTip("Surface Boundary")
-        self.tilt_slider.setToolTip("Tilt angle (-7 to +7 in 0.25 degree steps)")
-
-        form.addRow(self.auto_surface_check)
-        form.addRow(self._form_label("Channel"), self.channel_combo)
-        form.addRow(self._form_label("Tilt (-7..+7, 0.25)"), tilt_row)
-        form.addRow(self._form_label("Real Width (mm)"), self.real_width_spin)
-
-        self.manual_controls_container = QWidget()
-        manual_form = QFormLayout(self.manual_controls_container)
-        manual_form.setContentsMargins(0, 8, 0, 0)
-        manual_form.setRowWrapPolicy(QFormLayout.DontWrapRows)
-        manual_form.addRow(self._form_label("Threshold"), threshold_row)
-        manual_form.addRow(self._form_label("Smoothing"), smoothing_row)
-        manual_form.addRow(self._form_label("Despeckle"), despeckle_row)
-        manual_form.addRow(self._form_label("Crater Left Boundary"), zone_left_row)
-        manual_form.addRow(self._form_label("Crater Right Boundary"), zone_right_row)
-        manual_form.addRow(self._form_label("Surface Boundary"), surface_row)
-        manual_form.addRow(self._form_label("Scan Mode"), self.scan_toggle)
-        self.manual_controls_container.setVisible(not self.analysis_settings.auto_surface)
-        form.addRow(self.manual_controls_container)
-        self._update_scan_mode_label()
-        return group
-
-    def _build_overlay_controls(self) -> QGroupBox:
-        group = QGroupBox("View")
-        layout = QVBoxLayout(group)
-        self.show_mask = QCheckBox("Show Mask Panel")
-        self.show_mask.setChecked(False)
-        self.show_mask.setToolTip("Show/hide the lower binary mask preview panel.")
-        self.show_mask.stateChanged.connect(self._render_current)
-        self.show_guides = QCheckBox("Show Guides")
-        self.show_guides.setChecked(True)
-        self.show_guides.setToolTip("Show/hide guide overlays (blue box, yellow bounds, surface line).")
-        self.show_guides.stateChanged.connect(self._render_current)
-        self.show_profile = QCheckBox("Show Profile")
-        self.show_profile.setChecked(True)
-        self.show_profile.setToolTip("Show/hide the green traced crater profile.")
-        self.show_profile.stateChanged.connect(self._render_current)
-        self.show_enhanced = QCheckBox("Enhance low contrast")
-        self.show_enhanced.setChecked(False)
-        self.show_enhanced.setToolTip(
-            "Apply local contrast enhancement to the review image only. "
-            "Measurements continue to use source pixels."
-        )
-        self.show_enhanced.stateChanged.connect(self._render_current)
-        for widget in (
-            self.show_mask,
-            self.show_guides,
-            self.show_profile,
-            self.show_enhanced,
-        ):
-            layout.addWidget(widget)
-
-        self.guide_left_slider, self.guide_left_label, guide_left_row = self._slider_control(
-            0, 4000, self.analysis_settings.left_margin
-        )
-        self.guide_right_slider, self.guide_right_label, guide_right_row = self._slider_control(
-            0, 4000, self.analysis_settings.right_margin
-        )
-        self.guide_top_slider, self.guide_top_label, guide_top_row = self._slider_control(
-            0, 4000, self.analysis_settings.top_margin
-        )
-        self.guide_left_slider.setToolTip("Left guide margin in pixels for the blue rectangle.")
-        self.guide_right_slider.setToolTip("Right guide margin in pixels for the blue rectangle.")
-        self.guide_top_slider.setToolTip("Top guide margin in pixels for the blue rectangle.")
-        guide_form = QFormLayout()
-        guide_form.setRowWrapPolicy(QFormLayout.DontWrapRows)
-        guide_form.addRow(self._form_label("Guide Left"), guide_left_row)
-        guide_form.addRow(self._form_label("Guide Right"), guide_right_row)
-        guide_form.addRow(self._form_label("Guide Top"), guide_top_row)
-        layout.addLayout(guide_form)
-        return group
-
-    def _build_starred_frames_panel(self) -> QGroupBox:
-        group = QGroupBox("Accepted measurements")
-        layout = QVBoxLayout(group)
-
-        btn_row = QHBoxLayout()
-        self.star_btn = QPushButton("Accept current")
-        self.star_btn.setEnabled(False)
-        self.star_btn.setToolTip("Bookmark this frame with current settings/profile for export.")
-        self.star_btn.clicked.connect(self._star_current_frame)
-        btn_row.addWidget(self.star_btn)
-        self.unstar_btn = QPushButton("Remove")
-        self.unstar_btn.setToolTip("Remove the selected starred frame.")
-        self.unstar_btn.clicked.connect(self._remove_starred_frame)
-        btn_row.addWidget(self.unstar_btn)
-        layout.addLayout(btn_row)
-
-        self.session_combo = QComboBox()
-        self.session_combo.setToolTip("Saved sessions stored in ~/.crater_analysis/sessions")
-        layout.addWidget(self.session_combo)
-
-        session_row1 = QHBoxLayout()
-        session_row2 = QHBoxLayout()
-        save_selected_session_btn = QPushButton("Save")
-        save_selected_session_btn.setToolTip("Overwrite selected session with current starred frames/settings.")
-        save_selected_session_btn.clicked.connect(self._save_selected_session)
-        save_session_btn = QPushButton("Save As")
-        save_session_btn.setToolTip("Save current starred session under a new name.")
-        save_session_btn.clicked.connect(self._save_session_to_library)
-        load_session_btn = QPushButton("Load")
-        load_session_btn.setToolTip("Load selected session from the session library.")
-        load_session_btn.clicked.connect(self._load_selected_session)
-        rename_session_btn = QPushButton("Rename")
-        rename_session_btn.setToolTip("Rename selected session.")
-        rename_session_btn.clicked.connect(self._rename_selected_session)
-        delete_session_btn = QPushButton("Delete")
-        delete_session_btn.setToolTip("Delete selected session.")
-        delete_session_btn.clicked.connect(self._delete_selected_session)
-        refresh_sessions_btn = QPushButton("Refresh")
-        refresh_sessions_btn.setToolTip("Refresh session list from disk.")
-        refresh_sessions_btn.clicked.connect(self._refresh_sessions_list)
-        session_row1.addWidget(save_selected_session_btn)
-        session_row1.addWidget(save_session_btn)
-        session_row1.addWidget(load_session_btn)
-        session_row2.addWidget(rename_session_btn)
-        session_row2.addWidget(delete_session_btn)
-        session_row2.addWidget(refresh_sessions_btn)
-        layout.addLayout(session_row1)
-        layout.addLayout(session_row2)
-
-        self.starred_list = QListWidget()
-        self.starred_list.setMaximumHeight(120)
-        self.starred_list.itemClicked.connect(self._jump_to_starred_frame)
-        self.starred_list.setToolTip("Click a frame to jump to it and load its saved settings.")
-        layout.addWidget(self.starred_list)
-
-        self.starred_count_label = QLabel("0 accepted frames")
-        layout.addWidget(self.starred_count_label)
-        self._refresh_sessions_list()
-        return group
-
-    def _build_presets_controls(self) -> QGroupBox:
-        group = QGroupBox("Control Presets")
-        layout = QVBoxLayout(group)
-        self.preset_combo = QComboBox()
-        self.preset_combo.setToolTip("Presets stored in ~/.crater_analysis/presets")
-        layout.addWidget(self.preset_combo)
-
-        row1 = QHBoxLayout()
-        row2 = QHBoxLayout()
-        save_selected_btn = QPushButton("Save")
-        save_selected_btn.setToolTip("Overwrite selected preset with current controls.")
-        save_selected_btn.clicked.connect(self._save_selected_preset)
-        save_btn = QPushButton("Save As")
-        save_btn.setToolTip("Save controls as a new preset.")
-        save_btn.clicked.connect(self._save_preset_to_library)
-        load_btn = QPushButton("Load")
-        load_btn.setToolTip("Load selected preset into controls.")
-        load_btn.clicked.connect(self._load_selected_preset)
-        delete_btn = QPushButton("Delete")
-        delete_btn.setToolTip("Delete selected preset.")
-        delete_btn.clicked.connect(self._delete_selected_preset)
-        rename_btn = QPushButton("Rename")
-        rename_btn.setToolTip("Rename selected preset.")
-        rename_btn.clicked.connect(self._rename_selected_preset)
-        refresh_btn = QPushButton("Refresh")
-        refresh_btn.setToolTip("Refresh preset list from disk.")
-        refresh_btn.clicked.connect(self._refresh_presets_list)
-        row1.addWidget(save_selected_btn)
-        row1.addWidget(save_btn)
-        row1.addWidget(load_btn)
-        row2.addWidget(rename_btn)
-        row2.addWidget(delete_btn)
-        row2.addWidget(refresh_btn)
-        layout.addLayout(row1)
-        layout.addLayout(row2)
-        self._refresh_presets_list()
-        return group
-
-    def _build_export_controls(self) -> QGroupBox:
-        group = QGroupBox("Export")
-        layout = QVBoxLayout(group)
-        row1 = QHBoxLayout()
-        row2 = QHBoxLayout()
-        snap_btn = QPushButton("Snapshot")
-        snap_btn.setToolTip("Save current rendered frame as a PNG image.")
-        snap_btn.clicked.connect(self._export_snapshot)
-        profile_btn = QPushButton("Starred Profiles CSV")
-        profile_btn.setToolTip("Export calibrated (frame, x_mm, y_mm) rows for starred frames.")
-        profile_btn.clicked.connect(self._export_starred_profiles)
-        metrics_btn = QPushButton("Starred Metrics CSV")
-        metrics_btn.setToolTip("Export calibrated crater metrics (mm/mm^2) for each starred frame.")
-        metrics_btn.clicked.connect(self._export_starred_metrics)
-        fps_btn = QPushButton("Set FPS")
-        fps_btn.setToolTip("Set run FPS used to compute timestamp_ms in exported CSV files.")
-        fps_btn.clicked.connect(self._set_run_fps)
-        self.fps_label = QLabel(f"FPS: {self.run_fps:.2f}")
-        self.fps_label.setToolTip("Current FPS used for timestamp conversion. frame 1 (index 0) = 0 ms.")
-        row1.addWidget(snap_btn)
-        row1.addWidget(profile_btn)
-        row2.addWidget(metrics_btn)
-        row2.addWidget(fps_btn)
-        row2.addWidget(self.fps_label)
-        layout.addLayout(row1)
-        layout.addLayout(row2)
-        return group
-
-    def _build_metrics_panel(self) -> QGroupBox:
-        group = QGroupBox("Candidate")
-        layout = QVBoxLayout(group)
-        self.metrics_label = QLabel("No metrics yet.")
-        self.metrics_label.setWordWrap(True)
-        layout.addWidget(self.metrics_label)
-        self.analysis_note_label = QLabel(
-            "Open a run, then select Analyze run."
-        )
-        self.analysis_note_label.setWordWrap(True)
-        self.analysis_note_label.setStyleSheet("color: #7f8e9b; font-size: 12px;")
-        layout.addWidget(self.analysis_note_label)
-        return group
-
-    def _slider_control(self, lo: int, hi: int, value: int) -> tuple[QSlider, QLabel, QWidget]:
-        slider = QSlider(Qt.Horizontal)
-        slider.setRange(lo, hi)
-        slider.setValue(value)
-        slider.setMinimumWidth(150)
-        label = QLabel(str(value))
-        label.setMinimumWidth(44)
-        label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        row = QWidget()
-        layout = QHBoxLayout(row)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6)
-        layout.addWidget(slider, 1)
-        layout.addWidget(label)
-        slider.valueChanged.connect(lambda _: self._sync_settings())
-        return slider, label, row
-
-    def _form_label(self, text: str) -> QLabel:
-        label = QLabel(text)
-        label.setToolTip(self.LABEL_TOOLTIPS.get(text, text))
-        return label
-
-    def _update_scan_mode_label(self) -> None:
-        self.scan_toggle.setText("Bottom-Up" if self.scan_toggle.isChecked() else "Top-Down")
-
-    def _choose_video(self) -> None:
+    # ================================================================== video
+    def choose_video(self) -> None:
+        if not self.confirm_discard():
+            return
+        start = self.settings.value("last_dir", str(Path.home()))
         path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Open Video",
-            "",
-            "Video Files (*.mp4 *.mov *.avi *.mkv);;All Files (*)",
+            self, "Open video", start, "Video (*.mp4 *.mov *.avi *.mkv *.m4v);;All files (*)"
         )
-        if not path:
-            return
-        self._load_video_path(path)
+        if path:
+            self.settings.setValue("last_dir", str(Path(path).parent))
+            self.load_video(path)
 
-    def _load_video_path(self, path: str) -> None:
+    def load_video(self, path: str, session: Optional[Session] = None, session_path: Optional[Path] = None) -> bool:
         try:
-            if self.video is not None:
-                self.video.release()
-            self.video = VideoReader(path)
-            self.current_video_path = path
-            self.video_name_label.setText(Path(path).name)
-            self.stabilized_frame_index = None
-            self.stabilized_frame = None
-            self.guide_keyframes.clear()
-            self.guide_drafts.clear()
-            self._refresh_guide_keyframes()
-            self.analysis_note_label.setText(
-                "Single-frame preview. Select Analyze run for event-aware review."
-            )
-            self.run_fps = self.video.fps
-            self.fps_label.setText(f"FPS: {self.run_fps:.3f}")
-            self.current_frame_index = 0
-            self.frame_slider.setMaximum(max(0, self.video.frame_count - 1))
-            self.frame_slider.setValue(0)
-            self.frame_slider.show()
-            first_frame = self.video.get_frame(0)
-            if first_frame is not None:
-                h, w = first_frame.shape[:2]
-                half_w = max(1, w // 2)
-                self.zone_left_slider.setMaximum(half_w)
-                self.zone_right_slider.setMaximum(half_w)
-                self.surface_slider.setMaximum(max(1, h - 1))
-                self.guide_left_slider.setMaximum(max(1, w - 1))
-                self.guide_right_slider.setMaximum(max(1, w - 1))
-                self.guide_top_slider.setMaximum(max(1, h - 1))
-            self._render_current()
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Video Error", str(exc))
-
-    def _toggle_play(self) -> None:
-        if self.video is None:
-            return
-        if self.timer.isActive():
-            self.timer.stop()
-            self.play_btn.setText("Play")
-        else:
-            self.timer.start(33)
-            self.play_btn.setText("Pause")
-
-    def _advance_frame(self) -> None:
-        self._step_frame(1)
-
-    def _step_frame(self, delta: int) -> None:
-        if self.video is None:
-            return
-        nxt = (self.current_frame_index + delta) % self.video.frame_count
-        self.frame_slider.blockSignals(True)
-        self.frame_slider.setValue(nxt)
-        self.frame_slider.blockSignals(False)
-        self._on_frame_changed(nxt)
-
-    def _on_frame_changed(self, value: int) -> None:
-        self.current_frame_index = value
+            video = VideoReader(path)
+        except RuntimeError as exc:
+            QMessageBox.critical(self, "Open video", str(exc))
+            return False
+        self.stop_worker()
         if self.video is not None:
-            seconds = value / max(0.001, self.video.fps)
-            self.frame_position_label.setText(
-                f"Frame {value:,}  ·  {seconds:.2f} s"
-            )
-        self._render_current()
-
-    def _on_guide_draw_toggled(self, active: bool) -> None:
-        self.video_label.setCursor(Qt.CrossCursor if active else Qt.ArrowCursor)
-        self.draw_guide_btn.setText(
-            "Click crater points…" if active else "Draw line on this frame"
+            self.video.release()
+        self.video, self.video_path = video, path
+        self.keyframes, self.draft = {}, None
+        self.undo_stack.clear()
+        self.redo_stack.clear()
+        self.keyframe_widths.clear()
+        self.activity = None
+        self.session_extra = {}
+        self.session_path = None
+        self.calibration = None
+        self.frame_index = 0
+        self.open_button.setText(Path(path).name)
+        self.open_button.setToolTip(path)
+        self.meta_label.setText(
+            f"{video.width}×{video.height}  ·  {video.fps:.3f} fps  ·  {video.frame_count:,} fr"
         )
+        self.goto.blockSignals(True)
+        self.goto.setRange(0, video.frame_count - 1)
+        self.goto.setValue(0)
+        self.goto.blockSignals(False)
+        self.timeline.set_video(video.frame_count, video.fps)
+        self.export_step.setValue(max(1, int(round(video.fps / 24))))
+        self.session_name.setText(_sanitize_name(Path(path).stem))
+
+        if session is None:
+            matches = find_sessions_for_video(self.session_dir, path)
+            if matches:
+                try:
+                    session, session_path = load_session_file(matches[0]), matches[0]
+                except (OSError, ValueError, KeyError):
+                    session = None
+        if session is not None:
+            self._apply_session(session, session_path)
+        self.dirty = False
+        self._update_title()
+        start = min(self.keyframes) if self.keyframes else 0
+        self.seek(start)
+        self._refresh_all()
+        self.track_rows = []
+        self.timeline.set_tracking(None, None, None)
+        self.track_timer.start()
+        if session_path is not None:
+            self.flash(f"Loaded session {session_path.name}: {len(self.keyframes)} keyframe(s)")
+        return True
+
+    def _apply_session(self, session: Session, path: Optional[Path]) -> None:
+        self.keyframes = {k: list(v) for k, v in session.keyframes.items()}
+        self.calibration = session.calibration
+        self.session_extra = dict(session.extra)
+        activity = self.session_extra.get("activity")
+        if activity:
+            try:
+                self.activity = ActivityScan(
+                    np.asarray(activity["frames"]),
+                    np.asarray(activity["values"]),
+                    activity.get("event_frame"),
+                    activity.get("settled_frame"),
+                )
+            except (KeyError, TypeError):
+                self.activity = None
+        if self.calibration is not None and self.calibration.method == "frame_width" and self.calibration.known_mm:
+            self.frame_width_mm.blockSignals(True)
+            self.frame_width_mm.setValue(float(self.calibration.known_mm))
+            self.frame_width_mm.blockSignals(False)
+        self.session_path = path
+        if path is not None:
+            self.session_name.setText(path.stem)
+
+    # ============================================================ navigation
+    def seek(self, frame: int) -> None:
+        if self.video is None:
+            return
+        frame = int(min(max(0, frame), self.video.frame_count - 1))
+        if frame != self.frame_index and self.draft is not None and self.draft[0] != frame:
+            self.draft = None  # an uncommitted line belongs to its frame
+        self.frame_index = frame
+        self.goto.blockSignals(True)
+        self.goto.setValue(frame)
+        self.goto.blockSignals(False)
+        if self.edit_tool.isChecked():
+            self._prepare_draft()
+        self._refresh_frame()
+
+    def step(self, delta: int, wrap: bool = False) -> None:
+        if self.video is None:
+            return
+        target = self.frame_index + delta
+        if target >= self.video.frame_count or target < 0:
+            if not wrap:
+                self.play_timer.stop()
+                self.play_button.setText("Play")
+                target = min(max(0, target), self.video.frame_count - 1)
+        self.seek(target)
+
+    def toggle_play(self) -> None:
+        if self.video is None:
+            return
+        if self.play_timer.isActive():
+            self.play_timer.stop()
+            self.play_button.setText("Play")
+        else:
+            self.play_timer.start(33)
+            self.play_button.setText("Pause")
+
+    def jump_keyframe(self, direction: int) -> None:
+        keys = sorted(self.keyframes)
+        if not keys:
+            return
+        if direction > 0:
+            target = next((k for k in keys if k > self.frame_index), None)
+        else:
+            target = next((k for k in reversed(keys) if k < self.frame_index), None)
+        if target is not None:
+            self.seek(target)
+
+    # ================================================================ editing
+    def _snapshot(self):
+        return copy.deepcopy(self.keyframes), copy.deepcopy(self.draft)
+
+    def _push_undo(self) -> None:
+        self.undo_stack.append(self._snapshot())
+        del self.undo_stack[:-200]
+        self.redo_stack.clear()
+
+    def _mark_dirty(self) -> None:
+        self.dirty = True
+        self._update_title()
+
+    def undo(self) -> None:
+        if not self.undo_stack:
+            self.flash("Nothing to undo")
+            return
+        self.redo_stack.append(self._snapshot())
+        self.keyframes, self.draft = self.undo_stack.pop()
+        self._after_edit()
+
+    def redo(self) -> None:
+        if not self.redo_stack:
+            return
+        self.undo_stack.append(self._snapshot())
+        self.keyframes, self.draft = self.redo_stack.pop()
+        self._after_edit()
+
+    def _after_edit(self) -> None:
+        self._mark_dirty()
+        self.track_timer.start()
+        self.keyframe_widths = {k: v for k, v in self.keyframe_widths.items() if k in self.keyframes}
+        self.keyframe_widths.pop(self.frame_index, None)
+        self._refresh_all()
+
+    def _prepare_draft(self) -> None:
+        """Entering edit mode on a frame without a keyframe: seed its line."""
+
+        if self.frame_index in self.keyframes:
+            self.draft = None
+            return
+        if self.draft is not None and self.draft[0] == self.frame_index:
+            return
+        guide = guide_for_frame(self.keyframes, self.frame_index)
+        if guide is None:
+            self.draft = (self.frame_index, [])
+            return
+        nearest = guide.before if guide.before is not None else guide.after
+        count = len(self.keyframes.get(nearest, [])) or 12
+        self.draft = (self.frame_index, resample_points(guide.points, min(40, max(5, count))))
+
+    def set_edit_mode(self, active: bool) -> None:
+        if active and self.video is None:
+            self.edit_tool.setChecked(False)
+            return
         if active:
-            self.timer.stop()
-            self.play_btn.setText("Play")
-            self.guide_status_label.setText(
-                f"Drawing frame {self.current_frame_index:,} · click left to right"
-            )
+            self.scale_tool.setChecked(False)
+            if self.play_timer.isActive():
+                self.toggle_play()
+            self._prepare_draft()
         else:
-            self._refresh_guide_keyframes()
+            self.draft = None
+        self.canvas.set_mode("edit" if active else "view")
+        self._refresh_frame()
 
-    def _on_guided_tracking_changed(self, *_args) -> None:
-        guided = self.guided_tracking_check.isChecked()
-        if hasattr(self, "auto_surface_check"):
-            self.auto_surface_check.setEnabled(not guided)
-        if not guided and self.draw_guide_btn.isChecked():
-            self.draw_guide_btn.setChecked(False)
-        self._render_current()
+    def on_points_edited(self, points: List[Point]) -> None:
+        self._push_undo()
+        if len(points) >= 3:
+            self.keyframes[self.frame_index] = points
+            self.draft = None
+        else:
+            self.keyframes.pop(self.frame_index, None)
+            self.draft = (self.frame_index, points)
+        self._after_edit()
 
-    def _add_guide_point_from_view(self, widget_x: int, widget_y: int) -> None:
-        if not self.draw_guide_btn.isChecked() or self.video is None:
-            return
-        pixmap = self.video_label.pixmap()
-        if pixmap is None or pixmap.width() <= 0 or pixmap.height() <= 0:
-            return
-        image_width, image_height = self._composed_shape or (0, 0)
-        if image_width <= 0 or image_height <= 0:
-            return
-        offset_x = (self.video_label.width() - pixmap.width()) / 2.0
-        offset_y = (self.video_label.height() - pixmap.height()) / 2.0
-        local_x = widget_x - offset_x
-        local_y = widget_y - offset_y
-        if not (0 <= local_x < pixmap.width() and 0 <= local_y < pixmap.height()):
-            return
-        image_x = int(round(local_x * image_width / pixmap.width()))
-        image_y = int(round(local_y * image_height / pixmap.height()))
-        if image_y >= self._source_frame_height:
-            self.guide_status_label.setText("Draw on the video image, not the mask panel")
-            return
-        draft = self.guide_drafts.setdefault(self.current_frame_index, [])
-        if draft and image_x <= draft[-1][0]:
-            self.guide_status_label.setText("Points must move left to right · undo and try again")
-            return
-        draft.append((image_x, image_y))
-        self.guide_status_label.setText(
-            f"Frame {self.current_frame_index:,} · {len(draft)} point(s) · include both level wings"
-        )
-        self._render_current()
+    def keep_keyframe(self) -> None:
+        """Commit the line shown on this frame as a keyframe."""
 
-    def _undo_guide_point(self) -> None:
-        draft = self.guide_drafts.get(self.current_frame_index)
-        if draft:
-            draft.pop()
-            if not draft:
-                self.guide_drafts.pop(self.current_frame_index, None)
-            self._render_current()
-        self.guide_status_label.setText(
-            f"Frame {self.current_frame_index:,} · {len(draft or [])} point(s)"
-        )
-
-    def _save_guide_keyframe(self) -> None:
-        draft = self.guide_drafts.get(self.current_frame_index, [])
-        if len(draft) < 3:
-            QMessageBox.warning(
-                self,
-                "Guide Keyframe",
-                "Add at least three points along the subsurface boundary, including "
-                "level material before and after the crater.",
-            )
+        if self.video is None or self.frame_index in self.keyframes:
             return
-        self.guide_keyframes[self.current_frame_index] = list(draft)
-        self.guide_drafts.pop(self.current_frame_index, None)
-        self.draw_guide_btn.setChecked(False)
-        self._refresh_guide_keyframes()
-        self._render_current()
+        if self.draft is not None and self.draft[0] == self.frame_index and len(self.draft[1]) >= 3:
+            points = self.draft[1]
+        else:
+            guide = guide_for_frame(self.keyframes, self.frame_index)
+            if guide is None:
+                self.flash("Press D and click along the crater line first")
+                return
+            nearest = guide.before if guide.before is not None else guide.after
+            points = resample_points(guide.points, len(self.keyframes.get(nearest, [])) or 12)
+        self._push_undo()
+        self.keyframes[self.frame_index] = points
+        self.draft = None
+        self._after_edit()
+        self.flash(f"Keyframe kept at frame {self.frame_index:,}")
 
-    def _clear_current_guide(self) -> None:
-        self.guide_drafts.pop(self.current_frame_index, None)
-        self.guide_keyframes.pop(self.current_frame_index, None)
-        self._refresh_guide_keyframes()
-        self._render_current()
-
-    def _clear_all_guides(self) -> None:
-        if not self.guide_keyframes and not self.guide_drafts:
+    def clear_frame(self) -> None:
+        if self.frame_index not in self.keyframes and self.draft is None:
             return
-        reply = QMessageBox.question(
+        self._push_undo()
+        self.keyframes.pop(self.frame_index, None)
+        self.draft = (self.frame_index, []) if self.edit_tool.isChecked() else None
+        self._after_edit()
+
+    def escape(self) -> None:
+        if self.scale_tool.isChecked():
+            self.scale_tool.setChecked(False)
+        elif self.edit_tool.isChecked():
+            self.edit_tool.setChecked(False)
+
+    # ============================================================ calibration
+    def mm_per_px(self) -> float:
+        if self.calibration is not None:
+            return self.calibration.mm_per_px
+        width = self.video.width if self.video is not None else 1920
+        return self.frame_width_mm.value() / max(1, width)
+
+    def on_frame_width_changed(self, value: float) -> None:
+        self.settings.setValue("frame_width_mm", value)
+        if self.video is not None:
+            self.calibration = Calibration.from_frame_width(value, self.video.width)
+            self._mark_dirty()
+        self._refresh_frame()
+
+    def set_calibrate_mode(self, active: bool) -> None:
+        if active and self.video is None:
+            self.scale_tool.setChecked(False)
+            return
+        if active:
+            self.edit_tool.setChecked(False)
+            self.flash("Scale: click two points a known distance apart (Esc cancels)")
+        self.canvas.set_mode("calibrate" if active else ("edit" if self.edit_tool.isChecked() else "view"))
+        self._refresh_mode_label()
+
+    def on_calibration_picked(self, a: Point, b: Point) -> None:
+        self.scale_tool.setChecked(False)
+        distance_px = float(np.hypot(b[0] - a[0], b[1] - a[1]))
+        if distance_px < 5:
+            self.flash("Points too close together; try again")
+            return
+        known, ok = QInputDialog.getDouble(
             self,
-            "Clear Guides",
-            "Remove every crater-line keyframe from this run?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            "Measure scale",
+            f"Distance between the two points is {distance_px:.1f} px.\nReal distance (mm):",
+            10.0,
+            0.001,
+            100000.0,
+            3,
         )
-        if reply != QMessageBox.Yes:
-            return
-        self.guide_keyframes.clear()
-        self.guide_drafts.clear()
-        self._refresh_guide_keyframes()
-        self._render_current()
-
-    def _refresh_guide_keyframes(self) -> None:
-        if not hasattr(self, "guide_keyframe_list"):
-            return
-        self.guide_keyframe_list.clear()
-        for frame_index in sorted(self.guide_keyframes):
-            points = self.guide_keyframes[frame_index]
-            item = QListWidgetItem(f"Frame {frame_index:,} · {len(points)} points")
-            item.setData(Qt.UserRole, frame_index)
-            self.guide_keyframe_list.addItem(item)
-        count = len(self.guide_keyframes)
-        self.guide_status_label.setText(
-            f"{count} guide keyframe{'s' if count != 1 else ''}"
-            if count
-            else "No guide keyframes"
-        )
-
-    def _jump_to_guide_keyframe(self, item: QListWidgetItem) -> None:
-        frame_index = item.data(Qt.UserRole)
-        if frame_index is None or self.video is None:
-            return
-        self.frame_slider.setValue(int(frame_index))
-
-    def _sync_settings(self) -> None:
-        tilt = (self.tilt_slider.value() - 28) * 0.25
-        self.tilt_label.setText(f"{tilt:+.2f} deg")
-        self.threshold_label.setText(str(self.threshold_slider.value()))
-        self.smoothing_label.setText(str(self.smoothing_slider.value()))
-        self.despeckle_label.setText(str(self.despeckle_slider.value()))
-        self.zone_left_label.setText(str(self.zone_left_slider.value()))
-        self.zone_right_label.setText(str(self.zone_right_slider.value()))
-        self.surface_label.setText(str(self.surface_slider.value()))
-        self.guide_left_label.setText(str(self.guide_left_slider.value()))
-        self.guide_right_label.setText(str(self.guide_right_slider.value()))
-        self.guide_top_label.setText(str(self.guide_top_slider.value()))
-        self._update_scan_mode_label()
-        self.analysis_settings = AnalysisSettings(
-            auto_surface=self.auto_surface_check.isChecked(),
-            threshold=self.threshold_slider.value(),
-            smoothing=self.smoothing_slider.value(),
-            despeckle=self.despeckle_slider.value(),
-            tilt_degrees=tilt,
-            channel=self.channel_combo.currentIndex(),
-            zone_left=self.zone_left_slider.value(),
-            zone_right=self.zone_right_slider.value(),
-            surface_boundary=self.surface_slider.value(),
-            scan_mode=1 if self.scan_toggle.isChecked() else 0,
-            left_margin=self.guide_left_slider.value(),
-            right_margin=self.guide_right_slider.value(),
-            top_margin=self.guide_top_slider.value(),
-            x_step=self.analysis_settings.x_step,
-            real_width_mm=self.real_width_spin.value(),
-            auto_working_width_px=self.analysis_settings.auto_working_width_px,
-            auto_search_top_fraction=self.analysis_settings.auto_search_top_fraction,
-            auto_search_bottom_fraction=self.analysis_settings.auto_search_bottom_fraction,
-            auto_min_crater_width_fraction=self.analysis_settings.auto_min_crater_width_fraction,
-            auto_max_crater_width_fraction=self.analysis_settings.auto_max_crater_width_fraction,
-        )
-        for widget in (
-            self.threshold_slider,
-            self.smoothing_slider,
-            self.despeckle_slider,
-            self.zone_left_slider,
-            self.zone_right_slider,
-            self.surface_slider,
-            self.scan_toggle,
-        ):
-            widget.setEnabled(not self.analysis_settings.auto_surface)
-        self.manual_controls_container.setVisible(
-            not self.analysis_settings.auto_surface
-        )
-        self._render_current()
-
-    def _render_current(self) -> None:
-        if self.video is None:
-            return
-        if (
-            self.stabilized_frame_index == self.current_frame_index
-            and self.stabilized_frame is not None
-        ):
-            frame = self.stabilized_frame.copy()
-        else:
-            frame = self.video.get_frame_copy(self.current_frame_index)
-        if frame is None:
-            actual_max = max(0, self.video.frame_count - 1)
-            if self.current_frame_index > actual_max:
-                self.current_frame_index = actual_max
-                self.frame_slider.blockSignals(True)
-                self.frame_slider.setMaximum(actual_max)
-                self.frame_slider.setValue(actual_max)
-                self.frame_slider.blockSignals(False)
-                self._render_current()
-            return
-        settings = self.analysis_settings.normalized(frame.shape[0])
-        self._source_frame_height = frame.shape[0]
-        draft = self.guide_drafts.get(self.current_frame_index, [])
-        if self.guided_tracking_check.isChecked():
-            if len(draft) >= 2:
-                guide_points = list(draft)
-                is_keyframe = True
-            else:
-                guide_points, _, is_keyframe = interpolate_guides(
-                    self.guide_keyframes,
-                    self.current_frame_index,
-                    settings.x_step,
-                )
-            if guide_points:
-                self.current_result = self.engine.analyze_guided_frame(
-                    frame,
-                    settings,
-                    guide_points,
-                    is_keyframe=is_keyframe,
-                    snap_to_edge=self.snap_guide_check.isChecked(),
-                )
-            else:
-                self.current_result = AnalysisResult(
-                    frame=frame,
-                    solid_mask=np.zeros(frame.shape[:2], dtype=np.uint8),
-                    profile_points=[],
-                    metrics=compute_metrics([], settings.surface_boundary),
-                    geometry=None,
-                    detection_mode="guided",
-                    status="No crater line defined",
-                )
-        else:
-            self.current_result = self.engine.analyze_frame(frame, settings)
-        composed = self._compose_result(self.current_result, settings)
-        self._composed_shape = (composed.shape[1], composed.shape[0])
-        self.video_label.setPixmap(
-            frame_to_pixmap(composed).scaled(
-                self.video_label.size(),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
-            )
-        )
-        self._update_metrics(self.current_result)
-
-    def _build_temporally_stabilized_frame(
-        self, frame_index: int
-    ) -> Optional[np.ndarray]:
-        if self.video is None:
-            return None
-        offsets = (-12, -8, -4, 0, 4, 8, 12)
-        frames = []
-        for offset in offsets:
-            index = min(
-                self.video.frame_count - 1,
-                max(0, frame_index + offset),
-            )
-            frame = self.video.get_frame_copy(index)
-            if frame is not None:
-                frames.append(frame)
-        if not frames:
-            return None
-        if len(frames) == 1:
-            return frames[0]
-        return np.median(np.stack(frames), axis=0).astype(np.uint8)
-
-    def _compose_result(self, result: AnalysisResult, settings: AnalysisSettings) -> np.ndarray:
-        current_frame = result.frame.copy()
-        if self.show_enhanced.isChecked():
-            lab = cv2.cvtColor(current_frame, cv2.COLOR_BGR2LAB)
-            lightness, channel_a, channel_b = cv2.split(lab)
-            lightness = cv2.createCLAHE(
-                clipLimit=2.2, tileGridSize=(12, 8)
-            ).apply(lightness)
-            current_frame = cv2.cvtColor(
-                cv2.merge((lightness, channel_a, channel_b)),
-                cv2.COLOR_LAB2BGR,
-            )
-        mask_display = cv2.cvtColor(result.solid_mask, cv2.COLOR_GRAY2BGR)
-        h, w, _ = current_frame.shape
-        center_x = w // 2
-        left = center_x - settings.zone_left
-        right = center_x + settings.zone_right
-
-        def draw_both(p1, p2, color, thickness=1):
-            cv2.line(current_frame, p1, p2, color, thickness)
-            cv2.line(mask_display, p1, p2, color, thickness)
-
-        if self.show_guides.isChecked():
-            cv2.rectangle(
-                current_frame,
-                (settings.left_margin, settings.top_margin),
-                (w - settings.right_margin, h),
-                (255, 0, 0),
-                1,
-            )
-            if not settings.auto_surface:
-                draw_both((left, 0), (left, h), (0, 255, 255), 1)
-                draw_both((right, 0), (right, h), (0, 255, 255), 1)
-                draw_both(
-                    (settings.left_margin, settings.surface_boundary),
-                    (w - settings.right_margin, settings.surface_boundary),
-                    (255, 255, 0),
-                    2,
-                )
-
-        if self.show_profile.isChecked() and len(result.profile_points) > 1:
-            pts = np.array(result.profile_points, np.int32).reshape((-1, 1, 2))
-            cv2.polylines(current_frame, [pts], isClosed=False, color=(0, 255, 0), thickness=3)
-            cv2.polylines(mask_display, [pts], isClosed=False, color=(0, 255, 0), thickness=3)
-            if result.geometry is not None:
-                crater_pts = np.asarray(
-                    result.geometry.crater_points, dtype=np.int32
-                ).reshape((-1, 1, 2))
-                baseline_pts = np.asarray(
-                    result.geometry.baseline_points, dtype=np.int32
-                ).reshape((-1, 1, 2))
-                for panel in (current_frame, mask_display):
-                    cv2.polylines(
-                        panel, [crater_pts], isClosed=False, color=(0, 165, 255), thickness=4
-                    )
-                    cv2.polylines(
-                        panel, [baseline_pts], isClosed=False, color=(255, 200, 0), thickness=2
-                    )
-                    cv2.circle(panel, result.geometry.left_rim, 7, (255, 80, 80), -1)
-                    cv2.circle(panel, result.geometry.right_rim, 7, (255, 80, 80), -1)
-                    cv2.circle(panel, result.geometry.center, 7, (0, 80, 255), -1)
-
-        authored_points = self.guide_drafts.get(
-            self.current_frame_index,
-            self.guide_keyframes.get(self.current_frame_index, []),
-        )
-        if self.guided_tracking_check.isChecked() and authored_points:
-            raw = np.asarray(authored_points, dtype=np.int32).reshape((-1, 1, 2))
-            if len(authored_points) > 1:
-                cv2.polylines(
-                    current_frame,
-                    [raw],
-                    isClosed=False,
-                    color=(210, 80, 235),
-                    thickness=2,
-                )
-            for point_number, point in enumerate(authored_points):
-                cv2.circle(current_frame, point, 6, (210, 80, 235), -1)
-                if point_number in (0, len(authored_points) - 1):
-                    cv2.circle(current_frame, point, 9, (245, 210, 255), 2)
-
-        cv2.putText(
-            current_frame,
-            f"Frame {self.current_frame_index}",
-            (10, 24),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (255, 255, 255),
-            2,
-        )
-        cv2.putText(
-            current_frame,
-            f"Tilt {settings.tilt_degrees:+.2f} deg",
-            (10, 52),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
-            (200, 255, 255),
-            2,
-        )
-
-        if self.show_mask.isChecked():
-            return np.vstack((current_frame, mask_display))
-        return current_frame
-
-    def _update_metrics(self, result: AnalysisResult) -> None:
-        m = result.metrics
-        if result.detection_mode == "guided" and result.geometry is None:
-            self.metrics_label.setText(
-                "No crater measurement\n\n"
-                "Draw the true subsurface crater interface on a representative frame, "
-                "including level material on both sides."
-            )
-            self.star_btn.setEnabled(False)
-            self.star_btn.setToolTip("Define and review a guided crater line first.")
-            return
-        frame_width = max(1, result.frame.shape[1])
-        mm_per_px = self.analysis_settings.real_width_mm / frame_width
-        width_mm = m.max_crater_width_px * mm_per_px
-        depth_mm = m.max_crater_depth_px * mm_per_px
-        area_mm2 = m.crater_area_px * (mm_per_px**2)
-        self.metrics_label.setText(
-            "\n".join(
-                [
-                    f"{result.status} ({result.detection_mode})",
-                    f"Rim-to-rim width: {width_mm:.2f} mm  ({m.max_crater_width_px:.1f} px)",
-                    f"Maximum depth: {depth_mm:.2f} mm  ({m.max_crater_depth_px:.1f} px)",
-                    f"Cross-section area: {area_mm2:.2f} mm²  ({m.crater_area_px:.1f} px²)",
-                    f"Baseline tilt: {m.baseline_tilt_degrees:+.2f}°",
-                    (
-                        (
-                            "Guide source: operator keyframe"
-                            if "keyframe" in result.status.lower()
-                            else "Guide source: temporal interpolation"
-                        )
-                        if result.detection_mode == "guided"
-                        else f"Confidence: {m.confidence:.0%}"
-                    ),
-                    (
-                        f"Local edge support: {result.geometry.profile_confidence:.0%}"
-                        if result.detection_mode == "guided" and result.geometry is not None
-                        else (
-                            f"Surface visibility: {result.geometry.profile_confidence:.0%}"
-                            if result.geometry is not None
-                            else "Surface visibility: unavailable"
-                        )
-                    ),
-                ]
-            )
-        )
-        self.star_btn.setEnabled(
-            result.detection_mode == "manual"
-            or (result.detection_mode == "guided" and result.geometry is not None)
-            or (
-                result.geometry is not None
-                and result.metrics.confidence >= 0.42
-                and result.geometry.profile_confidence >= 0.35
-            )
-        )
-        if self.star_btn.isEnabled():
-            self.star_btn.setToolTip(
-                "Accept this reviewed frame and geometry for export."
-            )
-        else:
-            self.star_btn.setToolTip(
-                "Acceptance is disabled because the automatic evidence is weak. "
-                "Try contrast/channel controls or switch to manual mode."
-            )
-
-    def _star_current_frame(self) -> None:
-        if self.video is None or self.current_result is None:
-            QMessageBox.warning(self, "Star Frame", "Open a video and navigate to a frame first.")
-            return
-        frame = self.video.get_frame(self.current_frame_index)
-        if frame is None:
-            return
-        frame_w = frame.shape[1]
-        entry = StarredEntry(
-            frame_index=self.current_frame_index,
-            settings=copy.deepcopy(self.analysis_settings),
-            profile_points=list(self.current_result.profile_points),
-            frame_width_px=frame_w,
-            crater_points=(
-                list(self.current_result.geometry.crater_points)
-                if self.current_result.geometry is not None
-                else None
-            ),
-            baseline_points=(
-                list(self.current_result.geometry.baseline_points)
-                if self.current_result.geometry is not None
-                else None
-            ),
-            confidence=self.current_result.metrics.confidence,
-        )
-        self.starred_frames[self.current_frame_index] = entry
-        self._refresh_starred_list()
-
-    def _remove_starred_frame(self) -> None:
-        item = self.starred_list.currentItem()
-        if item is None:
-            QMessageBox.warning(self, "Remove", "Select a starred frame first.")
-            return
-        frame_idx = item.data(Qt.UserRole)
-        if frame_idx in self.starred_frames:
-            del self.starred_frames[frame_idx]
-        self._refresh_starred_list()
-
-    def _jump_to_starred_frame(self, item: QListWidgetItem) -> None:
-        frame_idx = item.data(Qt.UserRole)
-        if frame_idx is None or self.video is None:
-            return
-        entry = self.starred_frames.get(frame_idx)
-        if entry is not None:
-            self._apply_settings_to_ui(entry.settings)
-        self.frame_slider.blockSignals(True)
-        self.frame_slider.setValue(frame_idx)
-        self.frame_slider.blockSignals(False)
-        self._on_frame_changed(frame_idx)
-
-    def _apply_settings_to_ui(self, settings: AnalysisSettings) -> None:
-        self.auto_surface_check.blockSignals(True)
-        self.threshold_slider.blockSignals(True)
-        self.smoothing_slider.blockSignals(True)
-        self.despeckle_slider.blockSignals(True)
-        self.zone_left_slider.blockSignals(True)
-        self.zone_right_slider.blockSignals(True)
-        self.surface_slider.blockSignals(True)
-        self.tilt_slider.blockSignals(True)
-        self.channel_combo.blockSignals(True)
-        self.scan_toggle.blockSignals(True)
-        self.real_width_spin.blockSignals(True)
-        self.guide_left_slider.blockSignals(True)
-        self.guide_right_slider.blockSignals(True)
-        self.guide_top_slider.blockSignals(True)
-
-        self.auto_surface_check.setChecked(settings.auto_surface)
-        self.threshold_slider.setValue(settings.threshold)
-        self.smoothing_slider.setValue(settings.smoothing)
-        self.despeckle_slider.setValue(settings.despeckle)
-        self.channel_combo.setCurrentIndex(settings.channel)
-        self.zone_left_slider.setValue(settings.zone_left)
-        self.zone_right_slider.setValue(settings.zone_right)
-        self.surface_slider.setValue(settings.surface_boundary)
-        self.scan_toggle.setChecked(settings.scan_mode == 1)
-        self.tilt_slider.setValue(int(round((settings.tilt_degrees / 0.25) + 28)))
-        self.real_width_spin.setValue(settings.real_width_mm)
-        self.guide_left_slider.setValue(settings.left_margin)
-        self.guide_right_slider.setValue(settings.right_margin)
-        self.guide_top_slider.setValue(settings.top_margin)
-
-        self.threshold_slider.blockSignals(False)
-        self.smoothing_slider.blockSignals(False)
-        self.despeckle_slider.blockSignals(False)
-        self.zone_left_slider.blockSignals(False)
-        self.zone_right_slider.blockSignals(False)
-        self.surface_slider.blockSignals(False)
-        self.tilt_slider.blockSignals(False)
-        self.channel_combo.blockSignals(False)
-        self.scan_toggle.blockSignals(False)
-        self.real_width_spin.blockSignals(False)
-        self.guide_left_slider.blockSignals(False)
-        self.guide_right_slider.blockSignals(False)
-        self.guide_top_slider.blockSignals(False)
-        self.auto_surface_check.blockSignals(False)
-
-        self.analysis_settings = copy.deepcopy(settings)
-        self._sync_settings()
-
-    def _auto_find_crater(self) -> None:
-        if self.video is None or self.video.frame_count <= 0:
-            QMessageBox.warning(self, "Auto Find Crater", "Open a video first.")
-            return
-        if not self.analysis_settings.auto_surface:
-            QMessageBox.warning(
-                self,
-                "Auto Find Crater",
-                "Enable Automatic side-profile tracking first.",
-            )
-            return
-
-        sample_count = min(72, self.video.frame_count)
-        indices = np.unique(
-            np.linspace(0, self.video.frame_count - 1, sample_count, dtype=int)
-        )
-        progress = QProgressDialog(
-            "Sampling the video for crater candidates…",
-            "Cancel",
-            0,
-            len(indices),
-            self,
-        )
-        progress.setWindowTitle("Auto Find Crater")
-        progress.setMinimumDuration(0)
-        best_index: Optional[int] = None
-        best_status = ""
-        candidate_rows = []
-        scan_rows = []
-        for position, frame_index in enumerate(indices, start=1):
-            progress.setValue(position - 1)
-            progress.setLabelText(
-                f"Analyzing frame {frame_index:,} of {self.video.frame_count - 1:,}"
-            )
-            QApplication.processEvents()
-            if progress.wasCanceled():
-                break
-            frame = self.video.get_frame_copy(int(frame_index))
-            if frame is None:
-                continue
-            thumb = cv2.cvtColor(
-                cv2.resize(frame, (320, 180), interpolation=cv2.INTER_AREA),
-                cv2.COLOR_BGR2GRAY,
-            )
-            thumb = cv2.GaussianBlur(thumb, (7, 7), 0)
-            candidate = self.engine.analyze_frame(frame, self.analysis_settings)
-            scan_rows.append((int(frame_index), thumb, candidate))
-            width = candidate.metrics.max_crater_width_px
-            depth = candidate.metrics.max_crater_depth_px
-            if (
-                width <= 0.0
-                or depth / width > 0.65
-                or abs(candidate.metrics.baseline_tilt_degrees) > 20.0
-            ):
-                continue
-            score = (
-                depth
-                * (0.25 + candidate.metrics.confidence)
-            )
-            candidate_rows.append((score, int(frame_index), candidate, thumb))
-        progress.setValue(len(indices))
-
-        event_frame = 0
-        reference_thumb = None
-        if scan_rows:
-            reference_count = max(1, min(5, len(scan_rows) // 10))
-            reference_thumb = np.median(
-                np.stack([row[1] for row in scan_rows[:reference_count]]),
-                axis=0,
-            ).astype(np.float32)
-            motion_rows = []
-            for row_index in range(1, len(scan_rows)):
-                previous = scan_rows[row_index - 1][1].astype(np.float32)
-                current = scan_rows[row_index][1].astype(np.float32)
-                delta = current - previous
-                delta -= float(np.median(delta))
-                # Favor the material/air region and ignore most overhead hardware.
-                score = float(np.mean(np.abs(delta[35:125, 10:310])))
-                motion_rows.append((score, row_index))
-            if motion_rows:
-                motion_values = np.asarray([row[0] for row in motion_rows])
-                high_motion = float(np.percentile(motion_values, 90))
-                earliest_search = max(1, int(len(scan_rows) * 0.08))
-                event_candidates = [
-                    row
-                    for row in motion_rows
-                    if row[1] >= earliest_search and row[0] >= high_motion
-                ]
-                if event_candidates:
-                    # The first major transition is normally the experiment;
-                    # later camera handling should not replace it.
-                    _, event_position = min(event_candidates, key=lambda row: row[1])
-                    event_frame = scan_rows[event_position][0]
-
-        sample_gap = max(1, int(self.video.frame_count / max(1, sample_count)))
-        post_event_rows = [
-            row
-            for row in candidate_rows
-            if row[1] >= event_frame + sample_gap
-            and row[2].geometry is not None
-            and row[2].geometry.profile_confidence >= 0.45
-        ]
-        rows_to_rank = post_event_rows or candidate_rows
-
-        if rows_to_rank:
-            # Require temporal change and favor geometry that persists across
-            # neighboring post-event samples. Static pre-run mounds, transient
-            # dust edges, and glare should not win on shape alone.
-            change_values = []
-            if reference_thumb is not None:
-                for _, _, _, thumb in rows_to_rank:
-                    delta = thumb.astype(np.float32) - reference_thumb
-                    delta -= float(np.median(delta))
-                    change_values.append(
-                        float(np.mean(np.abs(delta[35:125, 10:310])))
-                    )
-            change_low = float(np.percentile(change_values, 15)) if change_values else 0.0
-            change_high = float(np.percentile(change_values, 90)) if change_values else 1.0
-            ranked_rows = []
-            for row_number, (score, frame_index, candidate, _) in enumerate(rows_to_rank):
-                metric = candidate.metrics
-                support = 0
-                for _, other_index, other, _ in rows_to_rank:
-                    if other_index == frame_index:
-                        continue
-                    if abs(other_index - frame_index) > max(
-                        3, int(self.video.frame_count / max(1, sample_count)) * 3
-                    ):
-                        continue
-                    other_metric = other.metrics
-                    center_close = abs(
-                        other_metric.crater_center_x_px - metric.crater_center_x_px
-                    ) <= max(30.0, metric.max_crater_width_px * 0.30)
-                    width_close = abs(
-                        other_metric.max_crater_width_px - metric.max_crater_width_px
-                    ) <= max(40.0, metric.max_crater_width_px * 0.45)
-                    if center_close and width_close:
-                        support += 1
-                stability_multiplier = 0.70 + min(0.60, support * 0.15)
-                if change_values:
-                    change_signal = float(
-                        np.clip(
-                            (change_values[row_number] - change_low)
-                            / max(0.001, change_high - change_low),
-                            0.0,
-                            1.0,
-                        )
-                    )
-                else:
-                    change_signal = 1.0
-                temporal_multiplier = 0.15 + (0.85 * change_signal)
-                ranked_rows.append(
-                    (
-                        score * stability_multiplier * temporal_multiplier,
-                        frame_index,
-                        candidate,
-                    )
-                )
-            _, best_index, best_candidate = max(ranked_rows, key=lambda row: row[0])
-            best_status = f"Post-event · {best_candidate.status}"
-
-        if best_index is None:
-            QMessageBox.warning(
-                self,
-                "Analyze Run",
-                "No stable post-event crater candidate was found. "
-                "Review the event manually or adjust the view controls.",
-            )
-            return
-        self.stabilized_frame_index = best_index
-        self.stabilized_frame = self._build_temporally_stabilized_frame(best_index)
-        self.analysis_note_label.setText(
-            f"Event-aware selection near frame {event_frame:,}. "
-            + (
-                "Draw the verified crater line here, then add keyframes where it changes."
-                if self.guided_tracking_check.isChecked()
-                else "Review uses a 7-frame temporal median to suppress moving dust and glare."
-            )
-        )
-        self.frame_slider.setValue(best_index)
-        if self.current_frame_index == best_index:
-            self._render_current()
-        self.statusBar().showMessage(
-            f"Selected frame {best_index:,} after event near frame {event_frame:,} — {best_status}",
-            10000,
-        )
-
-    def _refresh_starred_list(self) -> None:
-        self.starred_list.clear()
-        for idx in sorted(self.starred_frames.keys()):
-            entry = self.starred_frames[idx]
-            label = f"Frame {idx}  (thr={entry.settings.threshold}, tilt={entry.settings.tilt_degrees:+.2f})"
-            item = QListWidgetItem(label)
-            item.setData(Qt.UserRole, idx)
-            self.starred_list.addItem(item)
-        count = len(self.starred_frames)
-        self.starred_count_label.setText(
-            f"{count} accepted frame{'s' if count != 1 else ''}"
-        )
-
-    def _refresh_presets_list(self) -> None:
-        names = [p.name for p in list_presets(self.preset_dir)]
-        self.preset_combo.blockSignals(True)
-        self.preset_combo.clear()
-        self.preset_combo.addItems(names)
-        self.preset_combo.blockSignals(False)
-
-    def _save_preset_to_library(self) -> None:
-        suggested = f"preset_frame_{self.current_frame_index}"
-        name, ok = QInputDialog.getText(self, "Save Preset", "Preset name:", text=suggested)
         if not ok:
             return
-        name = name.strip()
-        if not name:
-            QMessageBox.warning(self, "Preset", "Preset name cannot be empty.")
-            return
-        path = save_named_preset(name, self.analysis_settings, self.preset_dir)
-        self._refresh_presets_list()
-        idx = self.preset_combo.findText(path.name)
-        if idx >= 0:
-            self.preset_combo.setCurrentIndex(idx)
+        self.calibration = Calibration(known / distance_px, "two_point", [a, b], known)
+        self._mark_dirty()
+        self._refresh_all()
+        self.flash(f"Scale set: {self.calibration.mm_per_px:.5f} mm/px")
 
-    def _save_selected_preset(self) -> None:
-        filename = self.preset_combo.currentText()
-        if not filename:
-            QMessageBox.warning(self, "Preset", "No preset selected.")
-            return
-        save_preset(str(self.preset_dir / filename), self.analysis_settings)
-        QMessageBox.information(self, "Preset Saved", f"Updated preset '{filename}'.")
+    # ============================================================== rendering
+    def _display_frame(self) -> Optional[np.ndarray]:
+        if self.video is None:
+            return None
+        if self.median_tool.isChecked():
+            frames = [
+                self.video.get_frame(min(self.video.frame_count - 1, max(0, self.frame_index + o)))
+                for o in (-12, -8, -4, 0, 4, 8, 12)
+            ]
+            frames = [f for f in frames if f is not None]
+            if frames:
+                return np.median(np.stack(frames), axis=0).astype(np.uint8)
+        return self.video.get_frame_copy(self.frame_index)
 
-    def _load_selected_preset(self) -> None:
-        filename = self.preset_combo.currentText()
-        if not filename:
-            QMessageBox.warning(self, "Preset", "No preset selected.")
-            return
-        preset = load_preset(str(self.preset_dir / filename))
-        if preset is None:
-            QMessageBox.warning(self, "Preset", "Could not load preset.")
-            return
-        self._apply_settings_to_ui(preset)
-        self._render_current()
+    def _refresh_all(self) -> None:
+        self._refresh_keyframe_table()
+        self._refresh_calibration()
+        self._refresh_export()
+        self.timeline.set_keyframes(self.keyframes.keys())
+        if self.activity is not None:
+            a = self.activity
+            self.timeline.set_activity(a.frames, a.activity, a.event_frame, a.settled_frame)
+        self._refresh_frame()
 
-    def _rename_selected_preset(self) -> None:
-        filename = self.preset_combo.currentText()
-        if not filename:
-            QMessageBox.warning(self, "Preset", "No preset selected.")
+    def _refresh_frame(self) -> None:
+        video = self.video
+        self.timeline.set_current(self.frame_index)
+        if video is None:
+            self.canvas.set_frame(None)
+            self.section.clear("Open a video, then trace the crater line with D")
+            self._show_measurement(None)
+            self._refresh_mode_label()
             return
-        suggested = Path(filename).stem
-        new_name, ok = QInputDialog.getText(self, "Rename Preset", "New preset name:", text=suggested)
-        if not ok:
+        frame = self._display_frame()
+        if frame is None:
             return
-        new_name = new_name.strip()
-        if not new_name:
-            QMessageBox.warning(self, "Preset", "Preset name cannot be empty.")
-            return
-        renamed_path = rename_named_preset(filename, new_name, self.preset_dir)
-        if renamed_path is None:
-            QMessageBox.warning(self, "Preset", "Could not rename selected preset.")
-            return
-        self._refresh_presets_list()
-        idx = self.preset_combo.findText(renamed_path.name)
-        if idx >= 0:
-            self.preset_combo.setCurrentIndex(idx)
+        self.time_label.setText(f"{self.frame_index / video.fps:.3f} s")
+        analysis_frame = frame
+        if self.enhance_tool.isChecked():
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            lab[:, :, 0] = cv2.createCLAHE(2.2, (12, 8)).apply(lab[:, :, 0])
+            frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        self.canvas.set_frame(frame)
 
-    def _delete_selected_preset(self) -> None:
-        filename = self.preset_combo.currentText()
-        if not filename:
-            QMessageBox.warning(self, "Preset", "No preset selected.")
-            return
-        reply = QMessageBox.question(
-            self,
-            "Delete Preset",
-            f"Delete preset '{filename}'?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+        keys = dict(self.keyframes)
+        draft_points: List[Point] = []
+        if self.draft is not None and self.draft[0] == self.frame_index:
+            draft_points = self.draft[1]
+            if len(draft_points) >= 3:
+                keys[self.frame_index] = draft_points
+        self.measurement = measure_frame(
+            self.engine, analysis_frame, keys, self.frame_index, snap=self.snap_tool.isChecked()
         )
-        if reply != QMessageBox.Yes:
-            return
-        if not delete_named_preset(filename, self.preset_dir):
-            QMessageBox.warning(self, "Preset", "Could not delete selected preset.")
-            return
-        self._refresh_presets_list()
+        overlays = Overlays()
+        if self.frame_index in self.keyframes:
+            overlays.clicks = list(self.keyframes[self.frame_index])
+            overlays.clicks_are_keyframe = True
+        elif draft_points:
+            overlays.clicks = list(draft_points)
+        elif self.measurement is not None:
+            overlays.guide = densify_guide(self.measurement.guide.points, 4)
+        if self.measurement is not None:
+            result = self.measurement.result
+            overlays.tracked = list(result.profile_points)
+            geometry = result.geometry
+            if geometry is not None:
+                overlays.baseline = geometry.baseline_points
+                overlays.left_rim, overlays.right_rim = geometry.left_rim, geometry.right_rim
+                overlays.deepest = geometry.center
+                ci = geometry.crater_points.index(geometry.center)
+                overlays.deepest_baseline_y = geometry.baseline_points[ci][1]
+                if self.measurement.guide.source == "keyframe" and self.frame_index in self.keyframes:
+                    width = result.metrics.max_crater_width_px * self.mm_per_px()
+                    if self.keyframe_widths.get(self.frame_index) != width:
+                        self.keyframe_widths[self.frame_index] = width
+                        self._refresh_keyframe_table()
+        self.canvas.set_overlays(overlays)
+        self._apply_overlay_visibility()
+        self._show_measurement(self.measurement)
+        self._refresh_mode_label()
 
-    def _refresh_sessions_list(self) -> None:
-        names = [p.name for p in list_sessions(self.session_dir)]
-        self.session_combo.blockSignals(True)
-        self.session_combo.clear()
-        self.session_combo.addItems(names)
-        self.session_combo.blockSignals(False)
+    def _apply_overlay_visibility(self) -> None:
+        self.canvas.show_clicks = self.show_clicks.isChecked()
+        self.canvas.show_tracked = self.show_tracked.isChecked()
+        self.canvas.show_geometry = self.show_geometry.isChecked()
+        self.canvas.update()
 
-    def _build_starred_session_payload(self) -> Dict:
-        entries = []
-        for frame_idx in sorted(self.starred_frames.keys()):
-            entry = self.starred_frames[frame_idx]
-            entries.append(
-                {
-                    "frame_index": entry.frame_index,
-                    "settings": entry.settings.to_dict(),
-                    "profile_points": [[x, y] for x, y in entry.profile_points],
-                    "frame_width_px": entry.frame_width_px,
-                    "crater_points": (
-                        [[x, y] for x, y in entry.crater_points]
-                        if entry.crater_points
-                        else []
+    def _show_measurement(self, measurement: Optional[FrameMeasurement]) -> None:
+        mm = self.mm_per_px()
+        geometry = measurement.result.geometry if measurement else None
+        warnings: List[str] = []
+        if measurement is None:
+            self.source_badge.setText("")
+            for value, sub in self.value_labels.values():
+                value.setText("—")
+                sub.setText("")
+            self.quality_label.setText("")
+            self.section.clear(
+                "No crater line yet. Press D and click along the interface, left to right."
+                if self.video is not None
+                else "Open a video to begin"
+            )
+        else:
+            guide: GuideSample = measurement.guide
+            if guide.source == "keyframe":
+                badge = "◆ keyframe" if self.frame_index in self.keyframes else "◇ unsaved line"
+            elif guide.source == "interpolated":
+                badge = f"interpolated · {guide.frames_to_key:,} fr to ◆"
+            else:
+                badge = f"held · {guide.frames_to_key:,} fr past ◆"
+                warnings.append("No keyframe on the other side of this frame; add one to bound the line.")
+            self.source_badge.setText(badge)
+            metrics = measurement.result.metrics
+            if geometry is None:
+                for value, sub in self.value_labels.values():
+                    value.setText("—")
+                    sub.setText("")
+                self.quality_label.setText("")
+                self.section.clear("The line has no dip below its level ends: no crater measured")
+            else:
+                values = {
+                    "width": (f"{metrics.max_crater_width_px * mm:.2f} mm", f"{metrics.max_crater_width_px:.1f} px"),
+                    "depth": (f"{metrics.max_crater_depth_px * mm:.2f} mm", f"{metrics.max_crater_depth_px:.1f} px"),
+                    "area": (f"{metrics.crater_area_px * mm * mm:.2f} mm²", f"{metrics.crater_area_px:,.0f} px²"),
+                    "tilt": (
+                        f"{metrics.baseline_tilt_degrees:+.2f}°",
+                        f"rims {geometry.left_rim[0]:.0f} / {geometry.right_rim[0]:.0f} px",
                     ),
-                    "baseline_points": (
-                        [[x, y] for x, y in entry.baseline_points]
-                        if entry.baseline_points
-                        else []
-                    ),
-                    "confidence": entry.confidence,
                 }
-            )
-        guide_keyframes = {
-            str(frame_index): [[x, y] for x, y in points]
-            for frame_index, points in sorted(self.guide_keyframes.items())
-        }
-        return {
-            "video_path": self.current_video_path,
-            "starred_frames": entries,
-            "guide_keyframes": guide_keyframes,
-        }
+                for key, (main, sub) in values.items():
+                    self.value_labels[key][0].setText(main)
+                    self.value_labels[key][1].setText(sub)
+                support = geometry.profile_confidence
+                self.quality_label.setText(
+                    f"edge support {support:.0%}  ·  confidence {geometry.geometry_confidence:.0%}"
+                    if self.snap_tool.isChecked()
+                    else f"snap off: measured from your line  ·  confidence {geometry.geometry_confidence:.0%}"
+                )
+                if self.snap_tool.isChecked() and support < WEAK_EDGE:
+                    warnings.append(f"Weak image edge ({support:.0%}). Check the tracked line by eye.")
+                warnings.extend(geometry.notes)
+                ci = geometry.crater_points.index(geometry.center)
+                self.section.set_data(
+                    measurement.result.profile_points,
+                    geometry.baseline_points,
+                    geometry.left_rim,
+                    geometry.right_rim,
+                    geometry.center,
+                    geometry.baseline_points[ci][1],
+                    mm,
+                )
+        self.warning_label.setText("\n".join(warnings))
+        self.warning_label.setVisible(bool(warnings))
 
-    def _save_session_to_library(self) -> None:
-        if not self.starred_frames and not self.guide_keyframes:
-            QMessageBox.warning(self, "Save Session", "No measurements or guide keyframes to save.")
-            return
-        suggested = f"session_frame_{self.current_frame_index}"
-        name, ok = QInputDialog.getText(self, "Save Session", "Session name:", text=suggested)
-        if not ok:
-            return
-        name = name.strip()
-        if not name:
-            QMessageBox.warning(self, "Save Session", "Session name cannot be empty.")
-            return
-        payload = self._build_starred_session_payload()
-        path = save_named_session(name, payload, self.session_dir)
-        self._refresh_sessions_list()
-        idx = self.session_combo.findText(path.name)
-        if idx >= 0:
-            self.session_combo.setCurrentIndex(idx)
-        QMessageBox.information(
-            self,
-            "Session Saved",
-            f"Saved {len(self.starred_frames)} measurement(s) and "
-            f"{len(self.guide_keyframes)} guide keyframe(s).",
-        )
+    def _refresh_mode_label(self) -> None:
+        if self.video is None:
+            text, accent = "", False
+        elif self.scale_tool.isChecked():
+            text, accent = "● SCALE  click two points a known distance apart · Esc cancels", True
+        elif self.edit_tool.isChecked():
+            count = len(self.keyframes.get(self.frame_index, self.draft[1] if self.draft else []))
+            state = "keyframe" if self.frame_index in self.keyframes else "not kept yet (S keeps)"
+            text, accent = f"● EDITING  {count} pts · {state} · click adds · drag moves · right-click deletes · Esc done", True
+        else:
+            text, accent = "D to edit the line on this frame", False
+        self.mode_label.setText(text)
+        self.mode_label.setStyleSheet(f"color: {theme.ACCENT if accent else theme.MUTED};")
 
-    def _save_selected_session(self) -> None:
-        filename = self.session_combo.currentText()
-        if not filename:
-            QMessageBox.warning(self, "Save Session", "No session selected.")
-            return
-        if not self.starred_frames and not self.guide_keyframes:
-            QMessageBox.warning(self, "Save Session", "No measurements or guide keyframes to save.")
-            return
-        save_session(str(self.session_dir / filename), self._build_starred_session_payload())
-        QMessageBox.information(self, "Session Saved", f"Updated session '{filename}'.")
+    def _refresh_keyframe_table(self) -> None:
+        keys = sorted(self.keyframes)
+        fps = self.video.fps if self.video else 30.0
+        self.keyframe_table.setRowCount(len(keys))
+        for row, k in enumerate(keys):
+            width = self.keyframe_widths.get(k)
+            cells = [f"◆ {k:,}", f"{k / fps:.3f}", str(len(self.keyframes[k])), f"{width:.2f}" if width else "—"]
+            for col, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                item.setData(Qt.UserRole, k)
+                if col >= 2:
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.keyframe_table.setItem(row, col, item)
+        self.keyframe_count.setText(f"{len(keys)} kept")
 
-    def _load_selected_session(self) -> None:
-        filename = self.session_combo.currentText()
-        if not filename:
-            QMessageBox.warning(self, "Load Session", "No session selected.")
+    def _refresh_calibration(self) -> None:
+        mm = self.mm_per_px()
+        if self.calibration is not None and self.calibration.method == "two_point":
+            detail = f"two-point: {self.calibration.known_mm:g} mm span"
+        else:
+            detail = "from frame width"
+        self.calibration_label.setText(f"{mm:.5f} mm/px  ·  {detail}")
+
+    def _refresh_export(self) -> None:
+        span = keyframe_span(self.keyframes)
+        if span is None:
+            self.export_range.setText("Needs at least one keyframe")
+            self.export_button.setEnabled(False)
+        else:
+            count = (span[1] - span[0]) // max(1, self.export_step.value()) + 1
+            self.export_range.setText(f"frames {span[0]:,}–{span[1]:,}  ·  ~{count:,} rows")
+            self.export_button.setEnabled(self.video is not None)
+
+    def on_cursor_moved(self, x: float, y: float) -> None:
+        if x < 0:
+            self.cursor_label.setText("")
+            return
+        mm = self.mm_per_px()
+        self.cursor_label.setText(f"x {x:7.1f}  y {y:7.1f} px  ·  {x * mm:6.2f}, {y * mm:6.2f} mm")
+
+    def flash(self, text: str) -> None:
+        self.status_label.setText(text)
+        QTimer.singleShot(6000, lambda: self.status_label.text() == text and self.status_label.setText(""))
+
+    def _update_title(self) -> None:
+        name = Path(self.video_path).name if self.video_path else "no video"
+        mark = " •" if self.dirty else ""
+        self.setWindowTitle(f"Crater {__version__} — {name}{mark}")
+        self.save_button.setText("Save •" if self.dirty else "Save")
+
+    # =============================================================== sessions
+    def _session(self) -> Session:
+        extra = dict(self.session_extra)
+        if self.activity is not None:
+            a = self.activity
+            extra["activity"] = {
+                "frames": [int(f) for f in a.frames],
+                "values": [round(float(v), 4) for v in a.activity],
+                "event_frame": a.event_frame,
+                "settled_frame": a.settled_frame,
+            }
+        calibration = self.calibration
+        if calibration is None and self.video is not None:
+            calibration = Calibration.from_frame_width(self.frame_width_mm.value(), self.video.width)
+        return Session(self.video_path or "", dict(self.keyframes), calibration, extra)
+
+    def save_session(self) -> bool:
+        if self.video is None:
+            return False
+        name = _sanitize_name(self.session_name.text().strip() or Path(self.video_path).stem)
+        path = self.session_dir / f"{name}.json"
+        if path.exists() and path != self.session_path:
+            try:
+                other = json.loads(path.read_text(encoding="utf-8")).get("video_path")
+            except (OSError, ValueError):
+                other = None
+            if other and Path(other).name != Path(self.video_path).name:
+                reply = QMessageBox.question(
+                    self,
+                    "Save session",
+                    f"'{path.name}' belongs to {Path(other).name}. Replace it?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if reply != QMessageBox.Yes:
+                    return False
+        save_session_file(path, self._session())
+        self.session_path = path
+        self.session_name.setText(name)
+        self.dirty = False
+        self._update_title()
+        self.flash(f"Saved {path.name}: {len(self.keyframes)} keyframe(s)")
+        return True
+
+    def open_session_dialog(self) -> None:
+        if not self.confirm_discard():
+            return
+        path, _ = QFileDialog.getOpenFileName(self, "Open session", str(self.session_dir), "Session (*.json)")
+        if not path:
             return
         try:
-            data = load_session(str(self.session_dir / filename))
-            if data is None:
-                QMessageBox.warning(self, "Load Session", "Could not load selected session.")
+            session = load_session_file(Path(path))
+        except (OSError, ValueError, KeyError) as exc:
+            QMessageBox.critical(self, "Open session", f"Could not read the session:\n{exc}")
+            return
+        video_path = session.video_path
+        if not video_path or not Path(video_path).exists():
+            QMessageBox.information(
+                self, "Open session", "The session's video was not found. Choose where it is now."
+            )
+            video_path, _ = QFileDialog.getOpenFileName(
+                self, "Locate video", str(Path.home()), "Video (*.mp4 *.mov *.avi *.mkv *.m4v)"
+            )
+            if not video_path:
                 return
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.critical(self, "Load Session", f"Failed to read session file:\n{exc}")
-            return
+            session.video_path = video_path
+        self.load_video(video_path, session, Path(path))
 
-        entries = data.get("starred_frames", [])
-        saved_guides = data.get("guide_keyframes", {})
-        if not entries and not saved_guides:
-            QMessageBox.warning(self, "Load Session", "Session file contains no measurements or guides.")
-            return
-
-        self.starred_frames.clear()
-        for item in entries:
-            frame_idx = int(item["frame_index"])
-            settings = AnalysisSettings.from_dict(item.get("settings", {}))
-            profile_points = [(int(p[0]), int(p[1])) for p in item.get("profile_points", [])]
-            frame_width_px = int(item.get("frame_width_px", 0))
-            crater_points = [
-                (int(p[0]), int(p[1])) for p in item.get("crater_points", [])
-            ]
-            baseline_points = [
-                (int(p[0]), int(p[1])) for p in item.get("baseline_points", [])
-            ]
-            self.starred_frames[frame_idx] = StarredEntry(
-                frame_index=frame_idx,
-                settings=settings,
-                profile_points=profile_points,
-                frame_width_px=frame_width_px,
-                crater_points=crater_points or None,
-                baseline_points=baseline_points or None,
-                confidence=float(item.get("confidence", 0.0)),
-            )
-        self.guide_keyframes = {
-            int(frame_index): [(int(point[0]), int(point[1])) for point in points]
-            for frame_index, points in saved_guides.items()
-            if isinstance(points, list) and len(points) >= 2
-        }
-        self.guide_drafts.clear()
-        self._refresh_starred_list()
-        self._refresh_guide_keyframes()
-
-        saved_video_path = data.get("video_path")
-        if self.video is None and saved_video_path and Path(saved_video_path).exists():
-            reply = QMessageBox.question(
-                self,
-                "Open Video",
-                f"Session references video:\n{saved_video_path}\n\nOpen it now?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.Yes,
-            )
-            if reply == QMessageBox.Yes:
-                self._load_video_path(saved_video_path)
-
-        QMessageBox.information(
-            self,
-            "Session Loaded",
-            f"Loaded {len(self.starred_frames)} measurement(s) and "
-            f"{len(self.guide_keyframes)} guide keyframe(s).",
-        )
-
-    def _rename_selected_session(self) -> None:
-        filename = self.session_combo.currentText()
-        if not filename:
-            QMessageBox.warning(self, "Rename Session", "No session selected.")
-            return
-        suggested = Path(filename).stem
-        new_name, ok = QInputDialog.getText(self, "Rename Session", "New session name:", text=suggested)
-        if not ok:
-            return
-        new_name = new_name.strip()
-        if not new_name:
-            QMessageBox.warning(self, "Rename Session", "Session name cannot be empty.")
-            return
-        renamed_path = rename_named_session(filename, new_name, self.session_dir)
-        if renamed_path is None:
-            QMessageBox.warning(self, "Rename Session", "Could not rename selected session.")
-            return
-        self._refresh_sessions_list()
-        idx = self.session_combo.findText(renamed_path.name)
-        if idx >= 0:
-            self.session_combo.setCurrentIndex(idx)
-
-    def _delete_selected_session(self) -> None:
-        filename = self.session_combo.currentText()
-        if not filename:
-            QMessageBox.warning(self, "Delete Session", "No session selected.")
-            return
+    def confirm_discard(self) -> bool:
+        if not self.dirty:
+            return True
         reply = QMessageBox.question(
             self,
-            "Delete Session",
-            f"Delete session '{filename}'?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+            "Unsaved changes",
+            "Save the current session first?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save,
         )
-        if reply != QMessageBox.Yes:
-            return
-        if not delete_named_session(filename, self.session_dir):
-            QMessageBox.warning(self, "Delete Session", "Could not delete selected session.")
-            return
-        self._refresh_sessions_list()
+        if reply == QMessageBox.Save:
+            return self.save_session()
+        return reply == QMessageBox.Discard
 
-    def _export_snapshot(self) -> None:
-        if self.current_result is None:
+    # ========================================================== background jobs
+    def run_tracking(self) -> None:
+        """Track every sampled frame between keyframes to show where it is weak."""
+
+        if self.track_worker is not None and self.track_worker.isRunning():
+            self.track_worker.cancel_requested = True
+            self.track_timer.start()  # try again once it has stopped
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Export Snapshot", "snapshot.png", "PNG (*.png)")
-        if not path:
+        span = keyframe_span(self.keyframes)
+        if self.video is None or span is None or span[0] == span[1]:
+            self.track_rows = []
+            self.timeline.set_tracking(None, None, None)
             return
-        rendered = self._compose_result(
-            self.current_result,
-            self.analysis_settings.normalized(self.current_result.frame.shape[0]),
+        step = max(1, (span[1] - span[0]) // 240)
+        worker = Worker(
+            measure_series,
+            self.video_path,
+            copy.deepcopy(self.keyframes),
+            start=span[0],
+            stop=span[1],
+            step=step,
+            fps=self.video.fps,
+            mm_per_px=1.0,
+            snap=self.snap_tool.isChecked(),
         )
-        export_snapshot(rendered, path)
+        worker.progressed.connect(lambda p: self.timeline.set_busy(f"tracking {p:.0%}"))
+        worker.done.connect(lambda result, w=worker: self._tracking_done(result, w))
+        worker.finished.connect(lambda: self.timeline.set_busy(None))
+        self.track_worker = worker
+        worker.start()
 
-    def _set_run_fps(self) -> None:
-        fps, ok = QInputDialog.getDouble(
-            self,
-            "Set Run FPS",
-            "Frames per second:",
-            self.run_fps,
-            0.01,
-            10000.0,
-            4,
+    def _tracking_done(self, result, worker: Worker) -> None:
+        if worker.cancel_requested or worker is not self.track_worker:
+            return
+        rows, _ = result
+        self.track_rows = rows
+
+        def number(value) -> float:
+            return float(value) if value not in ("", None) else float("nan")
+
+        self.timeline.set_tracking(
+            [r["frame"] for r in rows],
+            [number(r["edge_support"]) for r in rows],
+            [number(r["width_mm"]) for r in rows],
         )
-        if not ok:
+        weak = sum(1 for r in rows if number(r["edge_support"]) < WEAK_EDGE or r["edge_support"] == "")
+        if weak:
+            self.flash(f"Tracking weak on {weak} of {len(rows)} sampled frames (amber on the timeline). N jumps to the next.")
+
+    def next_weak_frame(self) -> None:
+        weak = [
+            r["frame"]
+            for r in self.track_rows
+            if r["edge_support"] == "" or float(r["edge_support"]) < WEAK_EDGE
+        ]
+        target = next((f for f in weak if f > self.frame_index), weak[0] if weak else None)
+        if target is None:
+            self.flash("No weak frames in the tracked range")
+        else:
+            self.seek(target)
+
+    def stop_worker(self) -> None:
+        if self.track_worker is not None and self.track_worker.isRunning():
+            self.track_worker.cancel_requested = True
+            self.track_worker.wait(5000)
+        if self.worker is not None and self.worker.isRunning():
+            self.worker.cancel_requested = True
+            self.worker.wait(5000)
+        self.worker = None
+        self.find_event_button.setText("Find event")
+        self.timeline.set_busy(None)
+
+    def find_event(self) -> None:
+        if self.video is None:
             return
-        self.run_fps = fps
-        self.fps_label.setText(f"FPS: {self.run_fps:.2f}")
-
-    def _frame_timestamp_ms(self, frame_idx: int) -> float:
-        if self.run_fps <= 0:
-            return 0.0
-        return (frame_idx / self.run_fps) * 1000.0
-
-    @staticmethod
-    def _trim_to_crater(pts: List[Tuple[int, int]], surface_boundary: int) -> List[Tuple[int, int]]:
-        """Keep only the crater portion of the profile, trimming flat wings at surface level.
-
-        Returns the contiguous span where the trace is below the surface,
-        plus one rim point on each side so the profile cleanly meets y=0.
-        """
-        sorted_pts = sorted(pts, key=lambda p: p[0])
-        below = [i for i, (_, y) in enumerate(sorted_pts) if y > surface_boundary]
-        if not below:
-            return []
-        lo = max(0, below[0] - 1)
-        hi = min(len(sorted_pts) - 1, below[-1] + 1)
-        return sorted_pts[lo: hi + 1]
-
-    def _export_starred_profiles(self) -> None:
-        if not self.starred_frames:
-            QMessageBox.warning(self, "Export", "No starred frames. Star some frames first.")
+        if self.worker is not None and self.worker.isRunning():
+            self.stop_worker()
             return
-
-        sign_choice, ok = QInputDialog.getItem(
-            self,
-            "Depth Sign Convention",
-            "Choose Y-axis direction for depth values:",
-            ["Positive-Down (depth values are positive)", "Negative-Down (depth values are negative)"],
-            0,
-            False,
-        )
-        if not ok:
+        if self.activity is not None:
+            self._jump_after_event()
             return
-        sign = 1.0 if "Positive" in sign_choice else -1.0
-
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Starred Profiles CSV",
-            "starred_profiles.csv",
-            "CSV (*.csv)",
-        )
-        if not path:
-            return
-
-        rows = []
-        for frame_idx in sorted(self.starred_frames.keys()):
-            entry = self.starred_frames[frame_idx]
-            if entry.frame_width_px <= 0:
-                continue
-            mm_per_px = entry.settings.real_width_mm / entry.frame_width_px
-            all_pts = sorted(entry.profile_points, key=lambda p: p[0])
-            for x_px, y_px in all_pts:
-                x_mm = x_px * mm_per_px
-                y_mm = (y_px - entry.settings.surface_boundary) * mm_per_px * sign
-                rows.append(
-                    {
-                        "frame": frame_idx,
-                        "timestamp_ms": round(self._frame_timestamp_ms(frame_idx), 4),
-                        "x_mm": round(x_mm, 4),
-                        "y_mm": round(y_mm, 4),
-                    }
-                )
-
-        export_profile_csv(rows, path)
-        QMessageBox.information(
-            self,
-            "Export Complete",
-            f"Exported {len(rows)} profile points from {len(self.starred_frames)} starred frame(s).",
-        )
-
-    def _export_starred_metrics(self) -> None:
-        if not self.starred_frames:
-            QMessageBox.warning(self, "Export", "No starred frames. Star some frames first.")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self,
-            "Export Starred Metrics CSV",
-            "starred_metrics.csv",
-            "CSV (*.csv)",
-        )
-        if not path:
-            return
-
-        rows = []
-        for frame_idx in sorted(self.starred_frames.keys()):
-            entry = self.starred_frames[frame_idx]
-            if entry.frame_width_px <= 0:
-                continue
-            mm_per_px = entry.settings.real_width_mm / entry.frame_width_px
-            if entry.crater_points and entry.baseline_points:
-                m = compute_geometry_metrics(
-                    entry.crater_points,
-                    entry.baseline_points,
-                    entry.confidence,
-                )
-            else:
-                center_x = entry.frame_width_px // 2
-                bracket_left = center_x - entry.settings.zone_left
-                bracket_right = center_x + entry.settings.zone_right
-                zone_pts = [
-                    (x, y)
-                    for x, y in entry.profile_points
-                    if bracket_left < x < bracket_right
-                ]
-                crater_pts = self._trim_to_crater(
-                    zone_pts, entry.settings.surface_boundary
-                )
-                if not crater_pts:
-                    continue
-                m = compute_metrics(crater_pts, entry.settings.surface_boundary)
-            rows.append(
-                {
-                    "frame": frame_idx,
-                    "timestamp_ms": round(self._frame_timestamp_ms(frame_idx), 4),
-                    "point_count": m.point_count,
-                    "avg_crater_width_mm": round(m.avg_crater_width_px * mm_per_px, 4),
-                    "max_crater_width_mm": round(m.max_crater_width_px * mm_per_px, 4),
-                    "trace_width_mm": round(m.trace_width_px * mm_per_px, 4),
-                    "max_crater_depth_mm": round(m.max_crater_depth_px * mm_per_px, 4),
-                    "crater_area_mm2": round(m.crater_area_px * (mm_per_px**2), 4),
-                    "confidence": round(m.confidence, 4),
-                }
+        self.worker = Worker(scan_activity, self.video_path, self.video.frame_count)
+        self.worker.progressed.connect(
+            lambda p: (
+                self.find_event_button.setText(f"Scanning {p:.0%} · stop"),
+                self.timeline.set_busy(f"scanning run {p:.0%}"),
             )
-        export_metrics_csv(rows, path)
-        QMessageBox.information(self, "Export Complete", f"Exported metrics for {len(rows)} starred frame(s).")
+        )
+        self.worker.done.connect(self._event_found)
+        self.worker.failed.connect(lambda msg: QMessageBox.warning(self, "Find event", msg))
+        self.worker.finished.connect(lambda: (self.find_event_button.setText("Find event"), self.timeline.set_busy(None)))
+        self.worker.start()
 
-    def _persist_window_state(self) -> None:
-        self.settings_store.setValue("geometry", self.saveGeometry())
-        self.settings_store.setValue("windowState", self.saveState())
+    def _event_found(self, scan: Optional[ActivityScan]) -> None:
+        if scan is None:
+            return
+        self.activity = scan
+        self._mark_dirty()
+        self.timeline.set_activity(scan.frames, scan.activity, scan.event_frame, scan.settled_frame)
+        if scan.event_frame is None:
+            self.flash("No clear event found; the activity trace is on the timeline")
+            return
+        self._jump_after_event()
 
-    def _restore_window_state(self) -> None:
-        geometry = self.settings_store.value("geometry")
-        state = self.settings_store.value("windowState")
-        if geometry is not None:
-            self.restoreGeometry(geometry)
-        if state is not None:
-            self.restoreState(state)
-        if geometry is None:
-            self.resize(1280, 820)
+    def _jump_after_event(self) -> None:
+        scan = self.activity
+        if scan is None or scan.event_frame is None or self.video is None:
+            return
+        target = scan.settled_frame or min(self.video.frame_count - 1, scan.event_frame + int(2 * self.video.fps))
+        self.seek(target)
+        self.flash(
+            f"Event at frame {scan.event_frame:,} ({scan.event_frame / self.video.fps:.2f} s); "
+            f"showing {target:,}, where the scene settles"
+        )
+
+    def export_series(self) -> None:
+        span = keyframe_span(self.keyframes)
+        if self.video is None or span is None:
+            return
+        default = str(Path(self.video_path).with_name(f"{Path(self.video_path).stem}_crater_series.csv"))
+        path, _ = QFileDialog.getSaveFileName(self, "Export time series", default, "CSV (*.csv)")
+        if not path:
+            return
+        dialog = QProgressDialog("Measuring frames…", "Cancel", 0, 1000, self)
+        dialog.setWindowTitle("Export time series")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        worker = Worker(
+            measure_series,
+            self.video_path,
+            dict(self.keyframes),
+            start=span[0],
+            stop=span[1],
+            step=self.export_step.value(),
+            fps=self.video.fps,
+            mm_per_px=self.mm_per_px(),
+            snap=self.snap_tool.isChecked(),
+            include_profiles=self.export_profiles.isChecked(),
+        )
+        worker.progressed.connect(lambda p: dialog.setValue(int(p * 1000)))
+        dialog.canceled.connect(lambda: setattr(worker, "cancel_requested", True))
+        worker.failed.connect(lambda msg: QMessageBox.warning(self, "Export", msg))
+        worker.done.connect(lambda result: self._write_series(path, result, worker.cancel_requested))
+        worker.finished.connect(dialog.close)
+        self._export_worker = worker
+        worker.start()
+
+    def _write_series(self, path: str, result, cancelled: bool) -> None:
+        rows, profiles = result
+        if cancelled:
+            self.flash("Export cancelled")
+            return
+        target = Path(path)
+        with target.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=SERIES_FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+        written = [target.name]
+        if profiles:
+            profile_path = target.with_name(target.stem + "_profiles.csv")
+            with profile_path.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(profiles[0].keys()))
+                writer.writeheader()
+                writer.writerows(profiles)
+            written.append(profile_path.name)
+        # Provenance next to the data: what produced these numbers.
+        meta = {
+            "app_version": __version__,
+            "video": self.video_path,
+            "frame_step": self.export_step.value(),
+            "snap_to_edge": self.snap_tool.isChecked(),
+            "session": self._session().to_payload(),
+        }
+        meta.pop("activity", None)
+        meta["session"].pop("activity", None)
+        meta_path = target.with_name(target.stem + "_meta.json")
+        meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        written.append(meta_path.name)
+        self.flash(f"Exported {len(rows):,} rows → {', '.join(written)}")
+
+    def save_snapshot(self) -> None:
+        image = self.canvas.render_snapshot()
+        if image is None or self.video_path is None:
+            return
+        default = str(Path(self.video_path).with_name(f"{Path(self.video_path).stem}_f{self.frame_index}.png"))
+        path, _ = QFileDialog.getSaveFileName(self, "Save snapshot", default, "PNG (*.png)")
+        if path:
+            image.save(path)
+            self.flash(f"Saved {Path(path).name}")
+
+    def show_about(self) -> None:
+        QMessageBox.about(
+            self,
+            "Crater",
+            f"Crater side-profile analyzer {__version__}\n\n"
+            "Operator-guided crater tracing with sub-pixel edge refinement.\n"
+            f"Sessions: {self.session_dir}",
+        )
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        if not self.confirm_discard():
+            event.ignore()
+            return
+        self.stop_worker()
+        export = getattr(self, "_export_worker", None)
+        if export is not None and export.isRunning():
+            export.cancel_requested = True
+            export.wait(10000)
+        if self.video is not None:
+            self.video.release()
+        self.settings.setValue("geometry", self.saveGeometry())
+        super().closeEvent(event)
+
+
+def _smoke_test(window: MainWindow, video: Optional[str]) -> int:
+    """Used by CI on the packaged app: build the UI, optionally analyse a video."""
+
+    QApplication.processEvents()
+    if video:
+        if not window.load_video(video):
+            return 1
+        window.keyframes = {0: [(0.1 * window.video.width, 0.5 * window.video.height),
+                                (0.5 * window.video.width, 0.6 * window.video.height),
+                                (0.9 * window.video.width, 0.5 * window.video.height)]}
+        window.seek(0)
+        if window.measurement is None:
+            return 1
+    print(f"Crater {__version__} smoke test OK", flush=True)
+    window.dirty = False
+    return 0
+
+
+class CraterApplication(QApplication):
+    """Routes macOS "Open With" / drag-onto-Dock video files to the window."""
+
+    def __init__(self, argv) -> None:
+        super().__init__(argv)
+        self.window: Optional[MainWindow] = None
+        self.pending_file: Optional[str] = None
+
+    def event(self, event) -> bool:  # type: ignore[override]
+        if event.type() == QEvent.FileOpen:
+            path = event.file()
+            if self.window is None:
+                self.pending_file = path
+            elif self.window.confirm_discard():
+                self.window.load_video(path)
+            return True
+        return super().event(event)
 
 
 def run_desktop() -> int:
-    app = QApplication(sys.argv)
-    window = CraterDashboardWindow()
+    args = [a for a in sys.argv[1:] if not a.startswith("-psn_")]  # macOS Finder arg
+    smoke = "--smoke-test" in args
+    args = [a for a in args if a != "--smoke-test"]
+    app = QApplication.instance() or CraterApplication(sys.argv)
+    app.setApplicationName("Crater")
+    icon = Path(__file__).resolve().parent / "assets" / "icon.png"
+    if icon.exists():
+        app.setWindowIcon(QIcon(str(icon)))
+    window = MainWindow()
+    if isinstance(app, CraterApplication):
+        app.window = window
+        if app.pending_file and not args:
+            args = [app.pending_file]
+    if smoke:
+        return _smoke_test(window, args[0] if args else None)
     window.show()
+    # Optional: `crater /path/to/video.mp4` opens that video directly.
+    if args and Path(args[0]).is_file():
+        window.load_video(args[0])
     return app.exec()
 
 

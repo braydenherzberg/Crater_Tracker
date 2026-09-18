@@ -1,89 +1,95 @@
-# Guided side-profile analysis
+# Measurement method
 
 ## Why the operator defines the interface
 
-Low-visibility side-camera footage can contain several plausible boundaries:
-container walls, material/air transitions, dust fronts, reflections, and the
-physical crater interface. Image strength alone cannot establish which one is
-the experimental target. The supplied runs demonstrated that the previous
-automatic surface detector could trace a clear boundary that was not the crater.
+Low-visibility side-camera footage contains several plausible boundaries:
+container walls, material/air transitions, dust fronts, reflections and the
+physical crater interface. Image strength alone cannot establish which is the
+experimental target; an earlier fully automatic detector traced clear
+boundaries that were not the crater. Crater therefore measures only a line the
+operator has placed on the intended interface, and uses the image only to
+refine that line locally.
 
-Guided tracking is therefore the default. The software reports no crater
-measurement until the operator identifies the intended physical interface.
+## From clicks to a measurement
 
-## Guided measurement model
+1. **Guide.** Clicks are joined left to right into a line sampled every pixel.
+   On a frame without its own keyframe the guide is interpolated in time
+   between the neighbouring keyframes (each resampled over its own x-range and
+   blended linearly). Before the first or after the last keyframe the nearest
+   keyframe is *held*.
+2. **Edge snap** (on by default, key E). Inside a ±14 px corridor around the
+   guide a dynamic-programming path search chooses one row per column. It
+   rewards vertical brightness change of the polarity that dominates along the
+   guide (normally brighter above, darker below), penalises distance from the
+   guide, and penalises slope changes relative to the guide. The image is
+   blurred 8 px along x and 2 px along y first, because interfaces are close to
+   horizontal. Rows are refined to sub-pixel precision and lightly smoothed
+   (σ = 3 px). The snap cannot leave the corridor, so it cannot jump to a
+   different interface.
+3. **Baseline and rims.** The outer ~16% of the line on each side defines the
+   undisturbed level (a straight-line fit). The rims are where the line leaves
+   and returns to that level: the first crossing of 8% of the maximum depth,
+   refined to the nearest return to the level. The first and last clicks are
+   not assumed to be rims, so the line must extend onto flat ground on both
+   sides; Crater warns when it does not, or when the two ends are not level.
+4. **Metrics.** Depth is the vertical distance below the rim-to-rim baseline.
+   Width is the horizontal rim-to-rim distance, area the integral of positive
+   depth, and tilt the angle of the baseline in image coordinates. Pixels are
+   converted with the session calibration.
 
-1. Scrub to a frame where the crater boundary can be identified.
-2. Click points left-to-right along the physical subsurface interface, including
-   a short level supporting section before and after the crater.
-3. Save the line as a guide keyframe.
-4. Add keyframes later in the video whenever the interpolated line no longer
-   follows the same interface.
-5. Review each measurement before accepting it for export.
+## Quality indicators
 
-Sparse clicks are linearly interpolated in image space to produce a dense
-profile. Between guide keyframes, the curves are resampled and interpolated in
-time. Before the first keyframe and after the last, the nearest guide is held;
-these extrapolated regions require particularly careful review.
+- **Edge support** is the share of columns where the brightness changes by at
+  least 3 grey levels across the snapped line (averaged 2–8 px either side).
+  On the supplied footage a visible interface scores ~90%, featureless regions
+  under 10%. Below 30% Crater shows a warning and the timeline marks the frame
+  in amber.
+- **Confidence** = 0.6 × temporal confidence + 0.4 × edge support. Temporal
+  confidence is 1 on a keyframe and exp(−d / 240) for a frame d frames from the
+  nearest keyframe (×0.7 when held beyond the last keyframe). It ranks frames
+  for review; it is not an uncertainty interval.
 
-When **Track nearby edge** is enabled, the interpolated curve is refined using
-vertical image-gradient evidence. Refinement is limited to 14 pixels around the
-guide and carries a strong distance penalty. This local step may improve fit in
-low contrast, but it cannot legitimately identify a different interface.
+## Measured repeatability
 
-The outer portions of the curve estimate the undisturbed local level. The rims
-are where the curve leaves and returns to that level; the first and last clicks
-are not assumed to be rims. Pixel coordinates increase downward, so depth is
-the positive vertical distance below the inferred rim baseline. Measurements are:
+On Mars Perfect Run 3, frame 9,191, twelve simulated operators each placed 7
+clicks with ±4 px of random error near the same line:
 
-- **Rim-to-rim width:** horizontal distance between inferred shoulder transitions
-- **Maximum depth:** largest vertical distance below the local rim baseline
-- **Cross-section area:** numerical integral of positive depth along the profile
-- **Baseline tilt:** angle of the local rim baseline in image coordinates
-- **Local edge support:** strength of nearby image-gradient evidence, not proof
-  that the selected interface is physically correct
+| | width, SD | depth, SD |
+| --- | --- | --- |
+| clicks only | 50.8 px (3.3 mm) | 4.8 px |
+| with edge snap | 8.9 px (0.57 mm) | 2.0 px |
 
-Pixels are converted to millimeters using the operator-entered physical width
-of the full source frame.
+The snap makes the result far less dependent on how carefully the line was
+clicked. Whether it lands on the *physically correct* interface still needs
+hand-labelled ground truth: see [benchmark.md](benchmark.md).
 
-## Event-aware review-frame selection
+## Finding the event
 
-**Analyze run** samples the recording, estimates the first major experiment
-transition, and proposes a stable post-event review frame. This is a navigation
-aid. It does not define the crater interface; the operator must still draw and
-save a guide line.
+**Find event** decodes the run in order, keeps a grey thumbnail about every
+N/600 frames and measures frame-to-frame change. The event is the strongest
+sustained burst of change (the most activity within ~2 s), not the first
+spike, because camera handling and lighting changes produce short spikes. The
+suggested review frame is the first quiet stretch after the burst. It is a
+navigation aid only.
 
-The proposed review image uses a seven-frame temporal median to reduce moving
-dust and transient glare. Measurements remain two-dimensional image-plane
-measurements.
+## Limitations
 
-## Legacy automatic detector
-
-When guided tracking is disabled, the legacy detector searches for a sustained
-bright-to-dark vertical transition, smooths it, and finds basin-like excursions.
-This remains useful for synthetic tests and some high-contrast material surfaces,
-but it is not a validated crater detector for the supplied low-visibility runs.
-Its confidence score is a shape/evidence heuristic, not a scientific uncertainty
-interval and not proof that the traced boundary is the crater.
-
-## Important limitations
-
-- A guide is a human annotation, not independent ground truth.
-- Interpolated frames can be wrong when the interface changes between keyframes.
-- Calibration assumes one horizontal millimeter-per-pixel scale across the frame.
-- Refraction and lens distortion through transparent walls are not corrected.
+- A keyframe is a human annotation, not independent ground truth.
+- Interpolated frames can be wrong where the interface changes between
+  keyframes; use the amber timeline marks and add keyframes there.
+- Calibration assumes one scale across the frame. Refraction through
+  transparent walls and lens distortion are not corrected; measuring the scale
+  in the crater's plane (key K) reduces the error.
 - Depth is vertical in image coordinates, not normal to a tilted baseline.
-- A partially cropped crater may not contain both physical rims.
+- A partially cropped crater may not contain both rims.
 - Cross-section area is not crater volume.
 
-## Recommended validation
-
-Before reporting scientific measurements:
+## Before reporting results
 
 1. Define the physical crater interface in experimental terms.
-2. Have a second reviewer label a representative blinded frame set.
-3. Compare guided/interpolated curves with those labels and retain the errors.
-4. Record calibration in the same optical plane as the crater.
-5. Measure repeatability across neighboring post-event frames.
-6. Preserve the software version, source filename, frame index, guide keyframes,
-   accepted overlay snapshots, and exported measurements.
+2. Label a representative frame set (`gt_*` sessions) and, ideally, have a
+   second person label the same frames; run the benchmark.
+3. Calibrate in the crater's optical plane.
+4. Check repeatability on neighbouring post-event frames.
+5. Keep the exported `_meta.json` with the data: it records the app version,
+   video, calibration, keyframes and settings that produced the numbers.

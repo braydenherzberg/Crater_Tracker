@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crater-analysis-app"
-version = "0.4.0"
+version = "0.5.0"
 description = "Offline side-profile crater tracing and measurement."
 requires-python = ">=3.10"
 dependencies = [
@@ -19,6 +19,13 @@ dev = ["pytest>=8,<10", "pyinstaller>=6,<7"]
 [project.scripts]
 crater-desktop = "crater_app.desktop.main:run_desktop"
 crater-batch = "crater_app.cli_batch:main"
+crater-benchmark = "crater_app.cli_benchmark:main"
+
+[tool.setuptools.packages.find]
+include = ["crater_app*"]
+
+[tool.setuptools.package-data]
+crater_app = ["desktop/assets/*.png"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
