@@ -14,8 +14,8 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -26,11 +26,12 @@ jobs:
       - name: Tests
         run: pytest -q
       - name: Desktop smoke test
+        timeout-minutes: 5
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          python packaging/make_sample_video.py sample.mp4
-          python run_desktop.py --smoke-test sample.mp4
+          SAMPLE=$(python packaging/make_sample_video.py sample.mp4)
+          python run_desktop.py --smoke-test "$SAMPLE"
 
   build:
     needs: test
@@ -40,14 +41,19 @@ jobs:
         include:
           - os: macos-latest
             asset: Crater-macOS-AppleSilicon.dmg
+            optional: false
           - os: macos-15-intel
             asset: Crater-macOS-Intel.dmg
+            optional: true  # Intel runners are scarce; never block a release
           - os: windows-latest
             asset: Crater-Windows.zip
+            optional: false
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    continue-on-error: ${{ matrix.optional }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
           cache: pip
@@ -56,24 +62,27 @@ jobs:
       - name: Build
         run: pyinstaller --noconfirm packaging/crater.spec
       - name: Sample video
-        run: python packaging/make_sample_video.py sample.mp4
+        shell: bash
+        run: echo "SAMPLE=$(python packaging/make_sample_video.py sample.mp4)" >> "$GITHUB_ENV"
 
       - name: Smoke-test and package (macOS)
         if: runner.os == 'macOS'
+        timeout-minutes: 15
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          dist/Crater.app/Contents/MacOS/Crater --smoke-test sample.mp4
+          dist/Crater.app/Contents/MacOS/Crater --smoke-test "$SAMPLE"
           mkdir dmg && cp -R dist/Crater.app dmg/ && ln -s /Applications dmg/Applications
           hdiutil create -volname Crater -srcfolder dmg -ov -format UDZO "${{ matrix.asset }}"
 
       - name: Smoke-test and package (Windows)
         if: runner.os == 'Windows'
+        timeout-minutes: 20
         shell: pwsh
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
-          $p = Start-Process -FilePath dist\Crater\Crater.exe -ArgumentList "--smoke-test","sample.mp4" -Wait -PassThru -NoNewWindow
+          $p = Start-Process -FilePath dist\Crater\Crater.exe -ArgumentList "--smoke-test","$env:SAMPLE" -Wait -PassThru -NoNewWindow
           if ($p.ExitCode -ne 0) { throw "smoke test failed: $($p.ExitCode)" }
           Compress-Archive -Path dist\Crater -DestinationPath "${{ matrix.asset }}"
           choco install innosetup -y --no-progress
@@ -90,13 +99,13 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: ${{ !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: actions/download-artifact@v4
         with:
           path: assets

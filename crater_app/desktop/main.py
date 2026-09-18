@@ -1361,9 +1361,17 @@ class MainWindow(QMainWindow):
 def _smoke_test(window: MainWindow, video: Optional[str]) -> int:
     """Used by CI on the packaged app: build the UI, optionally analyse a video."""
 
+    # Dialogs would block forever with nobody to click them: print instead.
+    def report(_parent, title, text, *args, **kwargs):
+        print(f"{title}: {text}", file=sys.stderr, flush=True)
+        return QMessageBox.Discard
+
+    for name in ("critical", "warning", "information", "question"):
+        setattr(QMessageBox, name, staticmethod(report))
     QApplication.processEvents()
     if video:
         if not window.load_video(video):
+            print("smoke test failed: could not open the video", file=sys.stderr, flush=True)
             return 1
         window.keyframes = {0: [(0.1 * window.video.width, 0.5 * window.video.height),
                                 (0.5 * window.video.width, 0.6 * window.video.height),
