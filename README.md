@@ -1,6 +1,7 @@
 # Crater
 
-Operator-guided crater tracing for side-camera impact videos. You draw the
+Operator-guided crater tracing for side-camera videos, including plume–surface
+experiments. You draw the
 crater line on a few frames; Crater snaps it to the image edge with sub-pixel
 precision, tracks it between your keyframes, shows you where tracking is weak,
 and exports calibrated width, depth and area for every frame.
@@ -23,6 +24,37 @@ blocked because the app is not yet notarized: open **System Settings → Privacy
 & Security** and click **Open Anyway**.
 **Windows:** if SmartScreen appears, click **More info → Run anyway**.
 
+## First launch and tutorial
+
+Click **Built-in tutorial** on the welcome screen (or **Tutorial** in the
+header, **Help → Built-in Tutorial**, F1). The seven-step walkthrough works
+without an internet connection and its buttons operate the real app. **Open
+practice video** loads a bundled synthetic clip, with a labelled 10 mm span
+and 64 mm full-image width, so you can practise calibration, tracing, saving
+and exporting before opening experiment footage. The clip illustrates the
+workflow; it is not experimental validation.
+
+**Help → Offline Help and Shortcuts** includes the workflow, controls and
+measurement limits. The online measurement-method link is optional.
+
+## Original threshold workflow
+
+**Tools → Original Threshold Tuner…** opens the current frame beside its
+threshold mask, with threshold, smoothing, despeckle, independent left/right
+zones, surface boundary, scan direction, channel and image tilt. After checking
+the candidate, choose **Use reviewed profile as keyframe** and refine it in
+the main canvas. Tilted candidates are mapped back to original image coordinates.
+This retains the original tuning workflow while using the current measurement
+and export system. The main workflow uses operator-defined guides rather than
+unattended threshold detection.
+
+Older sessions with `starred_frames` retain those records. **Tools → Review
+Original Saved Profile…** selects a saved frame and reopens its settings in the
+tuner for review. Original saved profiles are not silently accepted as new
+measurements; confirm the scale and review the interface first. The current
+baseline/rim method may produce different values from the original fixed-floor
+method.
+
 ## Workflow
 
 1. **Open a video** (⌘O / Ctrl+O). A saved session for the same video opens
@@ -30,9 +62,10 @@ blocked because the app is not yet notarized: open **System Settings → Privacy
 2. **Find event.** Crater scans the whole run (about 15 s for a 10,000-frame
    video), marks the experiment on the timeline and jumps to where the scene
    settles.
-3. **Set the scale.** Enter the real width of the full frame, or press **K** and
+3. **Set the scale.** Enter the real width of the full frame and click **Use width**, or press **K** and
    click two points a known distance apart (more accurate: measure in the
-   crater's plane).
+   crater's plane). Until scale is confirmed, measurements use pixels and
+   calibrated export is disabled.
 4. **Trace a keyframe.** Press **D** and click along the crater interface from
    flat ground on the left to flat ground on the right. A 5× loupe follows the
    cursor. Drag a point to move it, right-click to delete it.
@@ -44,6 +77,11 @@ blocked because the app is not yet notarized: open **System Settings → Privacy
 6. **Export** (⌘E / Ctrl+E) a CSV with one row per sampled frame, plus an
    optional profile-point CSV and a JSON file recording how the numbers were
    made.
+
+A single keyframe exports that frame only. Two or more keyframes define the
+interval for a time series. Contrast and temporal median affect the display
+only; measurement and export use the original frame. Snap is saved per session
+and applies to both desktop and command-line export.
 
 Save with ⌘S / Ctrl+S. Sessions live in `~/.crater_analysis/sessions/`.
 
@@ -69,7 +107,7 @@ Save with ⌘S / Ctrl+S. Sessions live in `~/.crater_analysis/sessions/`.
 | ⌘Z / ⌫ | Undo (⇧⌘Z redo) | N | Next weak frame |
 | E | Snap to edge on/off | Space | Play / pause |
 | C | Enhance contrast (display only) | Wheel | Zoom video · Alt-drag pans · F fits |
-| T | 7-frame temporal median (removes moving dust) | K | Measure scale |
+| T | 7-sample temporal median (display only) | K | Measure scale |
 | P | Save frame with overlays as PNG | Esc | Stop editing |
 
 ## Measurements

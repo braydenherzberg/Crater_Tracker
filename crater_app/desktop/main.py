@@ -18,6 +18,8 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDoubleSpinBox,
+    QDialog,
+    QScrollArea,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -58,6 +60,8 @@ from crater_app.core.session import (
 )
 from crater_app.core.video_reader import VideoReader
 from crater_app.desktop import theme
+from crater_app.desktop.help import Tutorial, show_reference
+from crater_app.desktop.legacy import ThresholdTuner
 from crater_app.desktop.canvas import FrameCanvas, Overlays
 from crater_app.desktop.section import SectionView
 from crater_app.desktop.sessions import _sanitize_name, default_session_dir
@@ -138,6 +142,8 @@ class MainWindow(QMainWindow):
         self.track_worker: Optional[Worker] = None
         self.track_rows: List[Dict] = []
 
+        self.tutorial = None
+        self.setMinimumSize(1000, 650)
         self._build_ui()
         self._build_menus()
         self.setStyleSheet(theme.STYLESHEET)
@@ -176,6 +182,7 @@ class MainWindow(QMainWindow):
         brand.setObjectName("brand")
         row.addWidget(brand)
         self.open_button = QPushButton("Open video…")
+        self.open_button.setMaximumWidth(260)
         self.open_button.setToolTip("Open a side-camera video (⌘O / Ctrl+O)")
         self.open_button.clicked.connect(self.choose_video)
         row.addWidget(self.open_button)
@@ -210,6 +217,9 @@ class MainWindow(QMainWindow):
         self.save_button.setToolTip("Save session (⌘S / Ctrl+S)")
         self.save_button.clicked.connect(self.save_session)
         row.addWidget(self.save_button)
+        self.help_button = QPushButton("Tutorial")
+        self.help_button.clicked.connect(self.show_tutorial)
+        row.addWidget(self.help_button)
         return header
 
     def _tool(self, label: str, key: str, tip: str, checkable: bool = False) -> QToolButton:
@@ -238,10 +248,10 @@ class MainWindow(QMainWindow):
         self.clear_tool.clicked.connect(self.clear_frame)
         self.snap_tool = self._tool("Snap", "E", "Snap the tracked line to the image edge within 14 px", True)
         self.snap_tool.setChecked(True)
-        self.snap_tool.toggled.connect(lambda _: (self._refresh_frame(), self.track_timer.start()))
+        self.snap_tool.toggled.connect(self.on_snap_changed)
         self.enhance_tool = self._tool("Contrast", "C", "Enhance low contrast (display only)", True)
         self.enhance_tool.toggled.connect(lambda _: self._refresh_frame())
-        self.median_tool = self._tool("Median", "T", "Temporal median of 7 frames: suppresses moving dust", True)
+        self.median_tool = self._tool("Median", "T", "Temporal median of 7 samples: visual review only; measurements use the original frame", True)
         self.median_tool.toggled.connect(lambda _: self._refresh_frame())
         self.scale_tool = self._tool("Scale", "K", "Calibrate: click two points a known distance apart", True)
         self.scale_tool.toggled.connect(self.set_calibrate_mode)
@@ -275,6 +285,23 @@ class MainWindow(QMainWindow):
             box.toggled.connect(self._apply_overlay_visibility)
             bar.addWidget(box)
         col.addLayout(bar)
+        self.welcome = QFrame()
+        intro = QVBoxLayout(self.welcome)
+        intro.setContentsMargins(14, 12, 14, 12)
+        title = QLabel("Measure a crater from side-camera video")
+        title.setStyleSheet("font-size: 20px;")
+        intro.addWidget(title)
+        text = QLabel("Set a scale, trace the physical interface, review tracking, then export width, depth and cross-section area. Runs offline.")
+        text.setWordWrap(True)
+        intro.addWidget(text)
+        actions = QHBoxLayout()
+        for label, fn in (("Built-in tutorial", self.show_tutorial), ("Open practice video", self.load_practice)):
+            button = QPushButton(label)
+            button.clicked.connect(fn)
+            actions.addWidget(button)
+        actions.addStretch()
+        intro.addLayout(actions)
+        col.addWidget(self.welcome)
         self.canvas = FrameCanvas()
         self.canvas.pointsEdited.connect(self.on_points_edited)
         self.canvas.calibrationPicked.connect(self.on_calibration_picked)
@@ -434,6 +461,10 @@ class MainWindow(QMainWindow):
         self.frame_width_mm.setValue(float(self.settings.value("frame_width_mm", DEFAULT_FRAME_WIDTH_MM)))
         self.frame_width_mm.valueChanged.connect(self.on_frame_width_changed)
         row.addWidget(self.frame_width_mm, 1)
+        self.confirm_width_button = QPushButton("Use width")
+        self.confirm_width_button.setToolTip("Confirm the full image width as this video's real scale")
+        self.confirm_width_button.clicked.connect(lambda: self.on_frame_width_changed(self.frame_width_mm.value()))
+        row.addWidget(self.confirm_width_button)
         scale_button = QPushButton("Measure…")
         scale_button.setToolTip("Click two points a known distance apart (K)")
         scale_button.clicked.connect(lambda: self.scale_tool.setChecked(True))
@@ -476,7 +507,13 @@ class MainWindow(QMainWindow):
         self.export_button.clicked.connect(self.export_series)
         lay.addWidget(self.export_button)
         col.addWidget(box)
-        return panel
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFixedWidth(360)
+        panel.setFixedWidth(342)
+        scroll.setWidget(panel)
+        return scroll
 
     def _build_statusbar(self) -> QWidget:
         bar = QFrame()
@@ -550,9 +587,90 @@ class MainWindow(QMainWindow):
         action(go_menu, "Find Event", None, self.find_event)
         action(None, "Undo (Backspace)", "Backspace", self.undo)
         action(None, "Stop Editing", "Escape", self.escape)
+        tools_menu = menu.addMenu("&Tools")
+        action(tools_menu, "Original Threshold Tuner…", None, self.show_threshold_tuner)
+        action(tools_menu, "Review Original Saved Profile…", None, self.review_original_profile)
+        action(tools_menu, "Next Weak Frame", None, self.next_weak_frame)
         help_menu = menu.addMenu("&Help")
+        action(help_menu, "Built-in Tutorial", "F1", self.show_tutorial)
+        action(help_menu, "Open Practice Video", None, self.load_practice)
+        action(help_menu, "Offline Help and Shortcuts", None, lambda: show_reference(self))
         action(help_menu, "Measurement Method", None, lambda: QDesktopServices.openUrl(QUrl(DOCS_URL)))
         action(help_menu, f"About Crater {__version__}", None, self.show_about)
+
+    def show_tutorial(self) -> None:
+        if self.tutorial is None:
+            self.tutorial = Tutorial(self)
+        self.tutorial.show()
+        self.tutorial.raise_()
+
+    def load_practice(self) -> None:
+        if not self.confirm_discard():
+            return
+        path = Path(__file__).resolve().parent / "assets" / "practice.avi"
+        if self.load_video(str(path), Session(str(path))):
+            self.frame_width_mm.setValue(64.0)
+            self.calibration = None
+            self.session_name.setText("practice")
+            self.dirty = False
+            self._refresh_all()
+            self._update_title()
+            self.flash("Synthetic practice clip: confirm 64 mm frame width, then trace the dark material's upper edge")
+
+    def focus_calibration(self) -> None:
+        self.frame_width_mm.setFocus()
+        self.frame_width_mm.selectAll()
+
+    def start_editing(self) -> None:
+        self.edit_tool.setChecked(True)
+
+    def tutorial_step_forward(self) -> None:
+        self.escape()
+        self.step(24)
+
+    def review_original_profile(self) -> None:
+        stars = self.session_extra.get("starred_frames") or []
+        valid = [r for r in stars if isinstance(r, dict) and isinstance(r.get("frame_index"), int)
+                 and self.video is not None and 0 <= r["frame_index"] < self.video.frame_count]
+        if not valid:
+            self.flash("This session has no original saved profiles. Open an older session from File → Open Session…")
+            return
+        labels = [f"Frame {r['frame_index']} · {len(r.get('profile_points', []))} original points" for r in valid]
+        selected, ok = QInputDialog.getItem(self, "Review original saved profile", "Choose a saved frame to review in the threshold tuner:", labels, 0, False)
+        if ok:
+            record = valid[labels.index(selected)]
+            self.seek(record["frame_index"])
+            self.show_threshold_tuner(record.get("settings") or {})
+
+    def show_threshold_tuner(self, saved_settings=None) -> None:
+        if self.video is None:
+            self.flash("Open a video before using the threshold tuner")
+            return
+        if self.play_timer.isActive():
+            self.toggle_play()
+        frame = self.video.get_frame_copy(self.frame_index)
+        if frame is None:
+            return
+        dialog = ThresholdTuner(frame, self, settings=saved_settings if isinstance(saved_settings, dict) else None)
+        if dialog.exec() == QDialog.Accepted and len(dialog.points) >= 3:
+            points = dialog.source_points()
+            if len(points) < 3:
+                self.flash("Too few candidate points inside the image; adjust the threshold tuner")
+                return
+            self._push_undo()
+            self.keyframes[self.frame_index] = resample_points(points, min(80, len(points)))
+            self.draft = None
+            self.session_extra.setdefault("threshold_seeds", {})[str(self.frame_index)] = dialog.analysis_settings().to_dict()
+            self._after_edit()
+            self.edit_tool.setChecked(True)
+            self.flash("Threshold profile kept: check the white tracked line and adjust points before exporting")
+
+    def on_snap_changed(self, _checked: bool) -> None:
+        if self.video is not None:
+            self._mark_dirty()
+        self.keyframe_widths.clear()
+        self._refresh_all()
+        self.track_timer.start()
 
     # ================================================================== video
     def choose_video(self) -> None:
@@ -573,6 +691,12 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Open video", str(exc))
             return False
         self.stop_worker()
+        self.track_worker = None
+        self.play_timer.stop()
+        self.play_button.setText("Play")
+        self.edit_tool.setChecked(False)
+        self.scale_tool.setChecked(False)
+        self.canvas.reset_view()
         if self.video is not None:
             self.video.release()
         self.video, self.video_path = video, path
@@ -599,11 +723,11 @@ class MainWindow(QMainWindow):
         self.session_name.setText(_sanitize_name(Path(path).stem))
 
         if session is None:
-            matches = find_sessions_for_video(self.session_dir, path)
+            matches = find_sessions_for_video(self.session_dir, path, exact_only=True)
             if matches:
                 try:
                     session, session_path = load_session_file(matches[0]), matches[0]
-                except (OSError, ValueError, KeyError):
+                except (OSError, ValueError, KeyError, TypeError, IndexError):
                     session = None
         if session is not None:
             self._apply_session(session, session_path)
@@ -615,12 +739,17 @@ class MainWindow(QMainWindow):
         self.track_rows = []
         self.timeline.set_tracking(None, None, None)
         self.track_timer.start()
-        if session_path is not None:
+        if self.session_extra.get("starred_frames") and not self.keyframes:
+            self.flash("Original saved profiles available: Tools → Review Original Saved Profile…; confirm scale before export")
+        elif session_path is not None:
             self.flash(f"Loaded session {session_path.name}: {len(self.keyframes)} keyframe(s)")
         return True
 
     def _apply_session(self, session: Session, path: Optional[Path]) -> None:
         self.keyframes = {k: list(v) for k, v in session.keyframes.items()}
+        self.snap_tool.blockSignals(True)
+        self.snap_tool.setChecked(bool(session.extra.get("snap_to_edge", True)))
+        self.snap_tool.blockSignals(False)
         self.calibration = session.calibration
         self.session_extra = dict(session.extra)
         activity = self.session_extra.get("activity")
@@ -675,7 +804,7 @@ class MainWindow(QMainWindow):
             self.play_timer.stop()
             self.play_button.setText("Play")
         else:
-            self.play_timer.start(33)
+            self.play_timer.start(max(1, round(1000 / self.video.fps)))
             self.play_button.setText("Pause")
 
     def jump_keyframe(self, direction: int) -> None:
@@ -810,13 +939,16 @@ class MainWindow(QMainWindow):
         if self.video is not None:
             self.calibration = Calibration.from_frame_width(value, self.video.width)
             self._mark_dirty()
-        self._refresh_frame()
+        self.keyframe_widths.clear()
+        self._refresh_all()
 
     def set_calibrate_mode(self, active: bool) -> None:
         if active and self.video is None:
             self.scale_tool.setChecked(False)
             return
         if active:
+            if self.play_timer.isActive():
+                self.toggle_play()
             self.edit_tool.setChecked(False)
             self.flash("Scale: click two points a known distance apart (Esc cancels)")
         self.canvas.set_mode("calibrate" if active else ("edit" if self.edit_tool.isChecked() else "view"))
@@ -840,6 +972,7 @@ class MainWindow(QMainWindow):
         if not ok:
             return
         self.calibration = Calibration(known / distance_px, "two_point", [a, b], known)
+        self.keyframe_widths.clear()
         self._mark_dirty()
         self._refresh_all()
         self.flash(f"Scale set: {self.calibration.mm_per_px:.5f} mm/px")
@@ -870,6 +1003,11 @@ class MainWindow(QMainWindow):
 
     def _refresh_frame(self) -> None:
         video = self.video
+        self.welcome.setVisible(video is None)
+        for control in (self.find_event_button, self.save_button, self.edit_tool, self.keep_tool,
+                        self.clear_tool, self.scale_tool, self.snapshot_tool, self.frame_width_mm,
+                        self.confirm_width_button, self.play_button, self.goto):
+            control.setEnabled(video is not None)
         self.timeline.set_current(self.frame_index)
         if video is None:
             self.canvas.set_frame(None)
@@ -881,7 +1019,9 @@ class MainWindow(QMainWindow):
         if frame is None:
             return
         self.time_label.setText(f"{self.frame_index / video.fps:.3f} s")
-        analysis_frame = frame
+        analysis_frame = video.get_frame_copy(self.frame_index)
+        if analysis_frame is None:
+            return
         if self.enhance_tool.isChecked():
             lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
             lab[:, :, 0] = cv2.createCLAHE(2.2, (12, 8)).apply(lab[:, :, 0])
@@ -916,7 +1056,7 @@ class MainWindow(QMainWindow):
                 ci = geometry.crater_points.index(geometry.center)
                 overlays.deepest_baseline_y = geometry.baseline_points[ci][1]
                 if self.measurement.guide.source == "keyframe" and self.frame_index in self.keyframes:
-                    width = result.metrics.max_crater_width_px * self.mm_per_px()
+                    width = result.metrics.max_crater_width_px * self.mm_per_px() if self.calibration else None
                     if self.keyframe_widths.get(self.frame_index) != width:
                         self.keyframe_widths[self.frame_index] = width
                         self._refresh_keyframe_table()
@@ -935,6 +1075,9 @@ class MainWindow(QMainWindow):
         mm = self.mm_per_px()
         geometry = measurement.result.geometry if measurement else None
         warnings: List[str] = []
+        calibrated = self.calibration is not None
+        if self.video is not None and not calibrated:
+            warnings.append("Scale not confirmed. Measurements are in pixels; set a scale before exporting mm.")
         if measurement is None:
             self.source_badge.setText("")
             for value, sub in self.value_labels.values():
@@ -973,6 +1116,9 @@ class MainWindow(QMainWindow):
                         f"rims {geometry.left_rim[0]:.0f} / {geometry.right_rim[0]:.0f} px",
                     ),
                 }
+                if not calibrated:
+                    for key in ("width", "depth", "area"):
+                        values[key] = (values[key][1], "set scale for mm" if key != "area" else "set scale for mm²")
                 for key, (main, sub) in values.items():
                     self.value_labels[key][0].setText(main)
                     self.value_labels[key][1].setText(sub)
@@ -993,7 +1139,7 @@ class MainWindow(QMainWindow):
                     geometry.right_rim,
                     geometry.center,
                     geometry.baseline_points[ci][1],
-                    mm,
+                    mm if calibrated else None,
                 )
         self.warning_label.setText("\n".join(warnings))
         self.warning_label.setVisible(bool(warnings))
@@ -1028,6 +1174,9 @@ class MainWindow(QMainWindow):
         self.keyframe_count.setText(f"{len(keys)} kept")
 
     def _refresh_calibration(self) -> None:
+        if self.calibration is None:
+            self.calibration_label.setText("Scale unconfirmed · enter full-frame width and click Use width, or Measure…")
+            return
         mm = self.mm_per_px()
         if self.calibration is not None and self.calibration.method == "two_point":
             detail = f"two-point: {self.calibration.known_mm:g} mm span"
@@ -1040,6 +1189,9 @@ class MainWindow(QMainWindow):
         if span is None:
             self.export_range.setText("Needs at least one keyframe")
             self.export_button.setEnabled(False)
+        elif self.calibration is None:
+            self.export_range.setText("Confirm scale before exporting mm")
+            self.export_button.setEnabled(False)
         else:
             count = (span[1] - span[0]) // max(1, self.export_step.value()) + 1
             self.export_range.setText(f"frames {span[0]:,}–{span[1]:,}  ·  ~{count:,} rows")
@@ -1050,6 +1202,9 @@ class MainWindow(QMainWindow):
             self.cursor_label.setText("")
             return
         mm = self.mm_per_px()
+        if self.calibration is None:
+            self.cursor_label.setText(f"x {x:7.1f}  y {y:7.1f} px")
+            return
         self.cursor_label.setText(f"x {x:7.1f}  y {y:7.1f} px  ·  {x * mm:6.2f}, {y * mm:6.2f} mm")
 
     def flash(self, text: str) -> None:
@@ -1064,7 +1219,8 @@ class MainWindow(QMainWindow):
 
     # =============================================================== sessions
     def _session(self) -> Session:
-        extra = dict(self.session_extra)
+        extra = copy.deepcopy(self.session_extra)
+        extra["snap_to_edge"] = self.snap_tool.isChecked()
         if self.activity is not None:
             a = self.activity
             extra["activity"] = {
@@ -1074,8 +1230,6 @@ class MainWindow(QMainWindow):
                 "settled_frame": a.settled_frame,
             }
         calibration = self.calibration
-        if calibration is None and self.video is not None:
-            calibration = Calibration.from_frame_width(self.frame_width_mm.value(), self.video.width)
         return Session(self.video_path or "", dict(self.keyframes), calibration, extra)
 
     def save_session(self) -> bool:
@@ -1098,7 +1252,11 @@ class MainWindow(QMainWindow):
                 )
                 if reply != QMessageBox.Yes:
                     return False
-        save_session_file(path, self._session())
+        try:
+            save_session_file(path, self._session())
+        except OSError as exc:
+            QMessageBox.warning(self, "Save session", f"Could not save the session:\n{exc}")
+            return False
         self.session_path = path
         self.session_name.setText(name)
         self.dirty = False
@@ -1114,7 +1272,7 @@ class MainWindow(QMainWindow):
             return
         try:
             session = load_session_file(Path(path))
-        except (OSError, ValueError, KeyError) as exc:
+        except (OSError, ValueError, KeyError, TypeError, IndexError) as exc:
             QMessageBox.critical(self, "Open session", f"Could not read the session:\n{exc}")
             return
         video_path = session.video_path
@@ -1172,6 +1330,8 @@ class MainWindow(QMainWindow):
         worker.progressed.connect(lambda p: self.timeline.set_busy(f"tracking {p:.0%}"))
         worker.done.connect(lambda result, w=worker: self._tracking_done(result, w))
         worker.finished.connect(lambda: self.timeline.set_busy(None))
+        worker.setParent(self)
+        worker.failed.connect(lambda msg: self.flash(f"Tracking failed: {msg}"))
         self.track_worker = worker
         worker.start()
 
@@ -1206,6 +1366,7 @@ class MainWindow(QMainWindow):
             self.seek(target)
 
     def stop_worker(self) -> None:
+        self.track_timer.stop()
         if self.track_worker is not None and self.track_worker.isRunning():
             self.track_worker.cancel_requested = True
             self.track_worker.wait(5000)
@@ -1232,9 +1393,10 @@ class MainWindow(QMainWindow):
                 self.timeline.set_busy(f"scanning run {p:.0%}"),
             )
         )
-        self.worker.done.connect(self._event_found)
+        self.worker.done.connect(lambda scan, w=self.worker: self._event_found(scan) if not w.cancel_requested and w is self.worker else None)
         self.worker.failed.connect(lambda msg: QMessageBox.warning(self, "Find event", msg))
         self.worker.finished.connect(lambda: (self.find_event_button.setText("Find event"), self.timeline.set_busy(None)))
+        self.worker.setParent(self)
         self.worker.start()
 
     def _event_found(self, scan: Optional[ActivityScan]) -> None:
@@ -1263,10 +1425,21 @@ class MainWindow(QMainWindow):
         span = keyframe_span(self.keyframes)
         if self.video is None or span is None:
             return
+        if self.calibration is None:
+            self.flash("Confirm the scale before exporting calibrated measurements")
+            self.focus_calibration()
+            return
         default = str(Path(self.video_path).with_name(f"{Path(self.video_path).stem}_crater_series.csv"))
         path, _ = QFileDialog.getSaveFileName(self, "Export time series", default, "CSV (*.csv)")
         if not path:
             return
+        metadata = {
+            "app_version": __version__, "video": self.video_path,
+            "frame_step": self.export_step.value(), "snap_to_edge": self.snap_tool.isChecked(),
+            "analysis_pixels": "original frame", "mm_per_px": self.mm_per_px(),
+            "session": self._session().to_payload(),
+        }
+        metadata["session"].pop("activity", None)
         dialog = QProgressDialog("Measuring frames…", "Cancel", 0, 1000, self)
         dialog.setWindowTitle("Export time series")
         dialog.setWindowModality(Qt.WindowModal)
@@ -1286,16 +1459,23 @@ class MainWindow(QMainWindow):
         worker.progressed.connect(lambda p: dialog.setValue(int(p * 1000)))
         dialog.canceled.connect(lambda: setattr(worker, "cancel_requested", True))
         worker.failed.connect(lambda msg: QMessageBox.warning(self, "Export", msg))
-        worker.done.connect(lambda result: self._write_series(path, result, worker.cancel_requested))
+        worker.done.connect(lambda result: self._write_series(path, result, worker.cancel_requested, metadata))
         worker.finished.connect(dialog.close)
+        worker.setParent(self)
         self._export_worker = worker
         worker.start()
 
-    def _write_series(self, path: str, result, cancelled: bool) -> None:
+    def _write_series(self, path: str, result, cancelled: bool, metadata: Dict) -> None:
         rows, profiles = result
         if cancelled:
             self.flash("Export cancelled")
             return
+        try:
+            self._write_series_files(path, rows, profiles, metadata)
+        except OSError as exc:
+            QMessageBox.warning(self, "Export", f"Could not finish writing the export. Check the destination and retry.\n{exc}")
+
+    def _write_series_files(self, path, rows, profiles, metadata):
         target = Path(path)
         with target.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.DictWriter(handle, fieldnames=SERIES_FIELDS)
@@ -1310,15 +1490,7 @@ class MainWindow(QMainWindow):
                 writer.writerows(profiles)
             written.append(profile_path.name)
         # Provenance next to the data: what produced these numbers.
-        meta = {
-            "app_version": __version__,
-            "video": self.video_path,
-            "frame_step": self.export_step.value(),
-            "snap_to_edge": self.snap_tool.isChecked(),
-            "session": self._session().to_payload(),
-        }
-        meta.pop("activity", None)
-        meta["session"].pop("activity", None)
+        meta = metadata
         meta_path = target.with_name(target.stem + "_meta.json")
         meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
         written.append(meta_path.name)
@@ -1352,6 +1524,11 @@ class MainWindow(QMainWindow):
         if export is not None and export.isRunning():
             export.cancel_requested = True
             export.wait(10000)
+        # Retain and finish any cancelled job before Qt destroys its thread.
+        for job in self.findChildren(Worker):
+            if job.isRunning():
+                job.cancel_requested = True
+                job.wait()
         if self.video is not None:
             self.video.release()
         self.settings.setValue("geometry", self.saveGeometry())
@@ -1379,6 +1556,33 @@ def _smoke_test(window: MainWindow, video: Optional[str]) -> int:
         window.seek(0)
         if window.measurement is None:
             return 1
+    # Validate that offline tutorial assets survive freezing, and exercise actual
+    # geometry on a known synthetic crater rather than only constructing a guide.
+    practice = Path(__file__).resolve().parent / "assets" / "practice.avi"
+    if not practice.is_file() or not window.load_video(str(practice), Session(str(practice))):
+        print("smoke test failed: bundled practice video unavailable", file=sys.stderr, flush=True)
+        return 1
+    window.calibration = Calibration.from_frame_width(64.0, window.video.width)
+    xs = np.linspace(80, 560, 49)
+    ys = 180 + np.where((xs > 220) & (xs < 420), 40 * np.sin(np.pi * (xs - 220) / 200) ** 2, 0)
+    window.keyframes = {0: list(zip(xs, ys))}
+    window.seek(0)
+    if window.measurement is None or window.measurement.result.geometry is None:
+        print("smoke test failed: practice geometry unavailable", file=sys.stderr, flush=True)
+        return 1
+    metrics = window.measurement.result.metrics
+    if not (160 < metrics.max_crater_width_px < 220 and 35 < metrics.max_crater_depth_px < 45):
+        print("smoke test failed: practice dimensions outside expected range", file=sys.stderr, flush=True)
+        return 1
+    tutorial = Tutorial(window)
+    for index in range(7):
+        tutorial.index = index
+        tutorial.refresh()
+    tuner = ThresholdTuner(window.video.get_frame_copy(0), window)
+    if len(tuner.points) < 3:
+        return 1
+    tutorial.close()
+    tuner.close()
     print(f"Crater {__version__} smoke test OK", flush=True)
     window.dirty = False
     return 0

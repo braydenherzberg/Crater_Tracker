@@ -1,3 +1,9 @@
+Crater 0.5.1 adds an offline tutorial, synthetic practice clip and offline help.
+The original threshold/mask workflow is available under Tools, including review
+of settings from original saved profiles. Calibrated export now requires scale
+confirmation; contrast and temporal median are display-only so measurements
+match export. Snap settings are preserved in sessions.
+
 ## Download
 
 | System | File |
@@ -14,3 +20,5 @@ Privacy & Security** and click **Open Anyway** (or right-click Crater → Open).
 Run anyway** (the app is not yet code-signed).
 
 See the README for the workflow and the measurement method.
+
+After launching, click **Tutorial** or **Open practice video** to get started.

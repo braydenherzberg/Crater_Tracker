@@ -63,7 +63,7 @@ def main(argv=None) -> int:
         step=args.frame_step,
         fps=fps,
         mm_per_px=calibration.mm_per_px,
-        snap=not args.no_snap,
+        snap=not args.no_snap and bool(session.extra.get("snap_to_edge", True)),
         include_profiles=args.profiles,
         progress=progress,
     )
@@ -83,7 +83,7 @@ def main(argv=None) -> int:
         "app_version": __version__,
         "video": video_path,
         "frame_step": args.frame_step,
-        "snap_to_edge": not args.no_snap,
+        "snap_to_edge": not args.no_snap and bool(session.extra.get("snap_to_edge", True)),
         "mm_per_px": calibration.mm_per_px,
         "session": str(Path(args.session).expanduser()),
     }

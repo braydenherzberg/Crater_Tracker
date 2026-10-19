@@ -8,6 +8,7 @@ work is never silently dropped.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,8 +34,13 @@ class Calibration:
 
     @classmethod
     def from_dict(cls, payload: Dict[str, Any]) -> "Calibration":
+        if not isinstance(payload, dict):
+            raise ValueError("Calibration must be an object")
+        scale = float(payload["mm_per_px"])
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError("Calibration scale must be finite and positive")
         return cls(
-            mm_per_px=float(payload["mm_per_px"]),
+            mm_per_px=scale,
             method=str(payload.get("method", "frame_width")),
             points=[(float(p[0]), float(p[1])) for p in payload.get("points", [])],
             known_mm=payload.get("known_mm"),
@@ -69,6 +75,8 @@ class Session:
 
     @classmethod
     def from_payload(cls, payload: Dict[str, Any]) -> "Session":
+        if not isinstance(payload, dict):
+            raise ValueError("Session must be a JSON object")
         keyframes = {
             int(frame): [(float(p[0]), float(p[1])) for p in points]
             for frame, points in (payload.get("guide_keyframes") or {}).items()
@@ -99,7 +107,7 @@ def load_session_file(path: Path) -> Session:
     return Session.from_payload(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
-def find_sessions_for_video(session_dir: Path, video_path: str) -> List[Path]:
+def find_sessions_for_video(session_dir: Path, video_path: str, *, exact_only: bool = False) -> List[Path]:
     """Sessions whose recorded video is this file (by path, then by name)."""
 
     if not session_dir.exists():
@@ -108,7 +116,12 @@ def find_sessions_for_video(session_dir: Path, video_path: str) -> List[Path]:
     exact, by_name = [], []
     for path in sorted(session_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
         try:
-            recorded = json.loads(path.read_text(encoding="utf-8")).get("video_path") or ""
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            recorded = payload.get("video_path") or ""
+            if not isinstance(recorded, str):
+                continue
         except (OSError, ValueError):
             continue
         if not recorded:
@@ -117,4 +130,4 @@ def find_sessions_for_video(session_dir: Path, video_path: str) -> List[Path]:
             exact.append(path)
         elif Path(recorded).name == target.name:
             by_name.append(path)
-    return exact + by_name
+    return exact if exact_only else exact + by_name

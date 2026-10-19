@@ -70,7 +70,8 @@ class SectionView(QWidget):
             return
         painter.setRenderHint(QPainter.Antialiasing, True)
         to_screen, sx, sy, x0 = self._mapping()
-        mm = self.mm_per_px
+        mm = self.mm_per_px if self.mm_per_px is not None else 1.0
+        unit = "mm" if self.mm_per_px is not None else "px"
 
         if self.baseline:
             painter.setPen(QPen(theme.color(theme.MUTED), 1, Qt.DashLine))
@@ -90,7 +91,7 @@ class SectionView(QWidget):
                 painter.drawLine(QPointF(p.x(), y_dim - 4), QPointF(p.x(), p.y()))
             painter.drawLine(QPointF(a.x(), y_dim), QPointF(b.x(), y_dim))
             width_mm = (self.right_rim[0] - self.left_rim[0]) * mm
-            label = f"{width_mm:.2f} mm"
+            label = f"{width_mm:.2f} {unit}"
             rect = QRectF((a.x() + b.x()) / 2 - 40, y_dim - 7, 80, 14)
             painter.fillRect(rect, theme.color(theme.PANEL))
             painter.setPen(theme.color(theme.TEXT))
@@ -103,7 +104,7 @@ class SectionView(QWidget):
             painter.drawLine(QPointF(bottom.x() - 8, bottom.y()), QPointF(bottom.x() + 8, bottom.y()))
             depth_mm = (self.deepest[1] - self.deepest_baseline_y) * mm
             painter.setPen(theme.color(theme.TEXT))
-            painter.drawText(QPointF(bottom.x() + 10, (top.y() + bottom.y()) / 2 + 4), f"{depth_mm:.2f} mm")
+            painter.drawText(QPointF(bottom.x() + 10, (top.y() + bottom.y()) / 2 + 4), f"{depth_mm:.2f} {unit}")
 
         painter.setPen(theme.color(theme.DIM))
         painter.drawText(
@@ -115,12 +116,12 @@ class SectionView(QWidget):
             ys = np.asarray([p[1] for p in self.profile])
             if xs.min() <= source_x <= xs.max():
                 y = float(np.interp(source_x, xs, ys))
-                text = f"x {source_x * mm:.2f} mm"
+                text = f"x {source_x * mm:.2f} {unit}"
                 if self.baseline:
                     bx = np.asarray([p[0] for p in self.baseline])
                     by = np.asarray([p[1] for p in self.baseline])
                     if bx.min() <= source_x <= bx.max():
-                        text += f"  ·  depth {(y - float(np.interp(source_x, bx, by))) * mm:.2f} mm"
+                        text += f"  ·  depth {(y - float(np.interp(source_x, bx, by))) * mm:.2f} {unit}"
                 painter.setPen(QPen(theme.color(theme.ACCENT, 160), 1))
                 painter.drawLine(QPointF(self._hover_x, 18), QPointF(self._hover_x, self.height()))
                 painter.setPen(theme.color(theme.TEXT))

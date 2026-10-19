@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.1
+
+- Added an offline seven-step tutorial with actions on the real application,
+  a bundled synthetic practice video, welcome-screen guidance and offline help.
+- Restored the original threshold/mask tuner with surface and zone controls,
+  channel and image tilt; reviewed candidates become editable guide keyframes.
+- Exposed original saved-profile settings for review without replacing old records.
+- Require explicit scale confirmation before mm export; uncalibrated measurements
+  display pixels instead of silently using the default frame width.
+- Keep temporal median and contrast display-only so preview measurements match export.
+- Persist edge-snap settings and respect them in command-line export; freeze export
+  provenance at job start. Surface file-write failures in the UI.
+- Stop playback and reset editing when switching videos; use recorded FPS for playback.
+- Avoid silently reopening sessions belonging to another same-named video.
+- Make the inspector scroll on smaller displays; add app-level workflow regression tests.
+
 ## 0.5.0
 
 Rebuilt desktop app around operator-guided tracing.

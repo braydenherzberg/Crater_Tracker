@@ -10,6 +10,23 @@ boundaries that were not the crater. Crater therefore measures only a line the
 operator has placed on the intended interface, and uses the image only to
 refine that line locally.
 
+## Original threshold tuner
+
+Tools → Original Threshold Tuner exposes the original threshold-mask workflow.
+A candidate is a starting guide, not an accepted physical measurement. Review it
+before keeping it as a keyframe. Channel and tilt affect the tuner; accepted
+points are inverse-rotated onto the original frame before guided measurement.
+Older saved-frame settings can be reopened with Tools → Review Original Saved
+Profile. Their old fixed-floor measurements are not assumed equivalent to the
+current rim/wing method.
+
+## Calibration and review pixels
+
+A new video has no confirmed physical scale. Measurements display pixels until
+the operator confirms full-image width or completes two-point calibration.
+Contrast enhancement and temporal median are display-only; all analysis uses
+the original frame. Edge snap is saved in the session and applied to export.
+
 ## From clicks to a measurement
 
 1. **Guide.** Clicks are joined left to right into a line sampled every pixel.
